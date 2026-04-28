@@ -26,9 +26,12 @@ type ConvertCodexResponseToClaudeParams struct {
 	HasToolCall               bool
 	BlockIndex                int
 	HasReceivedArgumentsDelta bool
+	HasTextDelta              bool
+	TextBlockOpen             bool
 	ThinkingBlockOpen         bool
 	ThinkingStopPending       bool
 	ThinkingSignature         string
+	ThinkingSummarySeen       bool
 }
 
 // ConvertCodexResponseToClaude performs sophisticated streaming response format conversion.
@@ -84,12 +87,8 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		if params.ThinkingBlockOpen && params.ThinkingStopPending {
 			output = append(output, finalizeCodexThinkingBlock(params)...)
 		}
-		template = []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`)
-		template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
-		params.ThinkingBlockOpen = true
-		params.ThinkingStopPending = false
-
-		output = translatorcommon.AppendSSEEventBytes(output, "content_block_start", template, 2)
+		params.ThinkingSummarySeen = true
+		output = append(output, startCodexThinkingBlock(params)...)
 	} else if typeStr == "response.reasoning_summary_text.delta" {
 		template = []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`)
 		template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
@@ -98,15 +97,14 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", template, 2)
 	} else if typeStr == "response.reasoning_summary_part.done" {
 		params.ThinkingStopPending = true
-		if params.ThinkingSignature != "" {
-			output = append(output, finalizeCodexThinkingBlock(params)...)
-		}
 	} else if typeStr == "response.content_part.added" {
 		template = []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`)
 		template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
+		params.TextBlockOpen = true
 
 		output = translatorcommon.AppendSSEEventBytes(output, "content_block_start", template, 2)
 	} else if typeStr == "response.output_text.delta" {
+		params.HasTextDelta = true
 		template = []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`)
 		template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
 		template, _ = sjson.SetBytes(template, "delta.text", rootResult.Get("delta").String())
@@ -115,6 +113,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 	} else if typeStr == "response.content_part.done" {
 		template = []byte(`{"type":"content_block_stop","index":0}`)
 		template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
+		params.TextBlockOpen = false
 		params.BlockIndex++
 
 		output = translatorcommon.AppendSSEEventBytes(output, "content_block_stop", template, 2)
@@ -164,15 +163,55 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 
 			output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", template, 2)
 		} else if itemType == "reasoning" {
+			params.ThinkingSummarySeen = false
 			params.ThinkingSignature = itemResult.Get("encrypted_content").String()
-			if params.ThinkingStopPending {
-				output = append(output, finalizeCodexThinkingBlock(params)...)
-			}
 		}
 	} else if typeStr == "response.output_item.done" {
 		itemResult := rootResult.Get("item")
 		itemType := itemResult.Get("type").String()
-		if itemType == "function_call" {
+		if itemType == "message" {
+			if params.HasTextDelta {
+				return [][]byte{output}
+			}
+			contentResult := itemResult.Get("content")
+			if !contentResult.Exists() || !contentResult.IsArray() {
+				return [][]byte{output}
+			}
+			var textBuilder strings.Builder
+			contentResult.ForEach(func(_, part gjson.Result) bool {
+				if part.Get("type").String() != "output_text" {
+					return true
+				}
+				if txt := part.Get("text").String(); txt != "" {
+					textBuilder.WriteString(txt)
+				}
+				return true
+			})
+			text := textBuilder.String()
+			if text == "" {
+				return [][]byte{output}
+			}
+
+			output = append(output, finalizeCodexThinkingBlock(params)...)
+			if !params.TextBlockOpen {
+				template = []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`)
+				template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
+				params.TextBlockOpen = true
+				output = translatorcommon.AppendSSEEventBytes(output, "content_block_start", template, 2)
+			}
+
+			template = []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`)
+			template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
+			template, _ = sjson.SetBytes(template, "delta.text", text)
+			output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", template, 2)
+
+			template = []byte(`{"type":"content_block_stop","index":0}`)
+			template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
+			params.TextBlockOpen = false
+			params.BlockIndex++
+			params.HasTextDelta = true
+			output = translatorcommon.AppendSSEEventBytes(output, "content_block_stop", template, 2)
+		} else if itemType == "function_call" {
 			template = []byte(`{"type":"content_block_stop","index":0}`)
 			template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
 			params.BlockIndex++
@@ -182,8 +221,13 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 			if signature := itemResult.Get("encrypted_content").String(); signature != "" {
 				params.ThinkingSignature = signature
 			}
-			output = append(output, finalizeCodexThinkingBlock(params)...)
+			if params.ThinkingSummarySeen {
+				output = append(output, finalizeCodexThinkingBlock(params)...)
+			} else {
+				output = append(output, finalizeCodexSignatureOnlyThinkingBlock(params)...)
+			}
 			params.ThinkingSignature = ""
+			params.ThinkingSummarySeen = false
 		}
 	} else if typeStr == "response.function_call_arguments.delta" {
 		params.HasReceivedArgumentsDelta = true
@@ -388,6 +432,29 @@ func buildReverseMapFromClaudeOriginalShortToOriginal(original []byte) map[strin
 
 func ClaudeTokenCount(_ context.Context, count int64) []byte {
 	return translatorcommon.ClaudeInputTokensJSON(count)
+}
+
+func startCodexThinkingBlock(params *ConvertCodexResponseToClaudeParams) []byte {
+	if params.ThinkingBlockOpen {
+		return nil
+	}
+
+	template := []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`)
+	template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
+	params.ThinkingBlockOpen = true
+	params.ThinkingStopPending = false
+
+	return translatorcommon.AppendSSEEventBytes(nil, "content_block_start", template, 2)
+}
+
+func finalizeCodexSignatureOnlyThinkingBlock(params *ConvertCodexResponseToClaudeParams) []byte {
+	if params.ThinkingSignature == "" {
+		return nil
+	}
+
+	output := startCodexThinkingBlock(params)
+	output = append(output, finalizeCodexThinkingBlock(params)...)
+	return output
 }
 
 func finalizeCodexThinkingBlock(params *ConvertCodexResponseToClaudeParams) []byte {
