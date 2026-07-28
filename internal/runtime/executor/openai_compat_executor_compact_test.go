@@ -44,6 +44,7 @@ func TestOpenAICompatExecutorCompactPassthrough(t *testing.T) {
 			"api_key":      "test",
 			"compat_name":  "compat",
 			"provider_key": "compat",
+			"wire_api":     "responses",
 		},
 	}
 	payload := []byte(`{"model":"gpt-5.1-codex-max","input":[{"role":"user","content":"hi"}]}`)
