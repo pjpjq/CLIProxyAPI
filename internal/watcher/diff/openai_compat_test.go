@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
 func TestDiffOpenAICompatibility(t *testing.T) {
@@ -43,6 +43,43 @@ func TestDiffOpenAICompatibility(t *testing.T) {
 	expectContains(t, changes, "provider updated: provider-a (api-keys 1 -> 2, models 1 -> 2, headers updated)")
 }
 
+func TestDiffOpenAICompatibilityPromptCacheKey(t *testing.T) {
+	oldList := []config.OpenAICompatibility{{Name: "provider-a", SupportPromptCacheKey: false}}
+	newList := []config.OpenAICompatibility{{Name: "provider-a", SupportPromptCacheKey: true}}
+
+	changes := DiffOpenAICompatibility(oldList, newList)
+	expectContains(t, changes, "provider updated: provider-a (support-prompt-cache-key false -> true)")
+}
+
+func TestDiffOpenAICompatibilityDuplicateNames(t *testing.T) {
+	oldList := []config.OpenAICompatibility{
+		{Name: "duplicate", SupportPromptCacheKey: false},
+		{Name: "duplicate", SupportPromptCacheKey: false},
+	}
+	newList := []config.OpenAICompatibility{
+		{Name: "duplicate", SupportPromptCacheKey: true},
+		{Name: "duplicate", SupportPromptCacheKey: false},
+	}
+
+	changes := DiffOpenAICompatibility(oldList, newList)
+	expectContains(t, changes, "provider updated: duplicate (support-prompt-cache-key false -> true)")
+}
+
+func TestDiffOpenAICompatibilityDuplicateKeyDoesNotCollide(t *testing.T) {
+	oldList := []config.OpenAICompatibility{
+		{Name: "foo"},
+		{Name: "foo#1"},
+	}
+	newList := []config.OpenAICompatibility{
+		{Name: "foo"},
+		{Name: "foo"},
+		{Name: "foo#1"},
+	}
+
+	changes := DiffOpenAICompatibility(oldList, newList)
+	expectContains(t, changes, "provider added: foo (api-keys=0, models=0)")
+}
+
 func TestDiffOpenAICompatibility_RemovedAndUnchanged(t *testing.T) {
 	oldList := []config.OpenAICompatibility{
 		{
@@ -65,6 +102,26 @@ func TestDiffOpenAICompatibility_RemovedAndUnchanged(t *testing.T) {
 	newList = nil
 	changes := DiffOpenAICompatibility(oldList, newList)
 	expectContains(t, changes, "provider removed: provider-a (api-keys=1, models=1)")
+}
+
+func TestDiffOpenAICompatibility_WireAPIVisibleWithoutSecrets(t *testing.T) {
+	oldList := []config.OpenAICompatibility{{
+		Name:          "provider-a",
+		APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "old-secret-key"}},
+	}}
+	newList := []config.OpenAICompatibility{{
+		Name:          "provider-a",
+		WireAPI:       "responses",
+		APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "new-secret-key"}},
+	}}
+
+	changes := DiffOpenAICompatibility(oldList, newList)
+	expectContains(t, changes, `provider updated: provider-a (wire-api "" -> "responses")`)
+	for _, change := range changes {
+		if strings.Contains(change, "old-secret-key") || strings.Contains(change, "new-secret-key") {
+			t.Fatalf("diff leaked API key material: %s", change)
+		}
+	}
 }
 
 func TestOpenAICompatKeyFallbacks(t *testing.T) {

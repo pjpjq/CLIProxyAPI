@@ -3,7 +3,7 @@ package responses
 import (
 	"context"
 
-	. "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/gemini/openai/responses"
+	. "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/gemini/openai/responses"
 	"github.com/tidwall/gjson"
 )
 
@@ -22,12 +22,12 @@ func ConvertAntigravityResponseToOpenAIResponsesNonStream(ctx context.Context, m
 	}
 
 	requestResult := gjson.GetBytes(originalRequestRawJSON, "request")
-	if responseResult.Exists() {
+	if requestResult.Exists() {
 		originalRequestRawJSON = []byte(requestResult.Raw)
 	}
 
 	requestResult = gjson.GetBytes(requestRawJSON, "request")
-	if responseResult.Exists() {
+	if requestResult.Exists() {
 		requestRawJSON = []byte(requestResult.Raw)
 	}
 

@@ -5,9 +5,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher/diff"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 func TestNewStableIDGenerator(t *testing.T) {
@@ -286,4 +286,36 @@ func TestAddConfigHeadersToAttrs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAddRequestRetryToMetadata(t *testing.T) {
+	zero := 0
+	positive := 2
+	negative := -1
+
+	metadata := map[string]any{}
+	addRequestRetryToMetadata(&zero, metadata)
+	if got, ok := metadata["request_retry"].(int); !ok || got != 0 {
+		t.Fatalf("zero request-retry = %v, want 0", metadata["request_retry"])
+	}
+
+	metadata = map[string]any{}
+	addRequestRetryToMetadata(&positive, metadata)
+	if got, ok := metadata["request_retry"].(int); !ok || got != 2 {
+		t.Fatalf("positive request-retry = %v, want 2", metadata["request_retry"])
+	}
+
+	metadata = map[string]any{}
+	addRequestRetryToMetadata(&negative, metadata)
+	if _, exists := metadata["request_retry"]; exists {
+		t.Fatalf("negative request-retry should be omitted, got %v", metadata["request_retry"])
+	}
+
+	metadata = map[string]any{}
+	addRequestRetryToMetadata(nil, metadata)
+	if _, exists := metadata["request_retry"]; exists {
+		t.Fatalf("nil request-retry should be omitted, got %v", metadata["request_retry"])
+	}
+
+	addRequestRetryToMetadata(&positive, nil)
 }

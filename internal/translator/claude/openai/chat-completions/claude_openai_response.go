@@ -25,8 +25,17 @@ type ConvertAnthropicResponseToOpenAIParams struct {
 	CreatedAt    int64
 	ResponseID   string
 	FinishReason string
+	Usage        claudeUsageTokens
 	// Tool calls accumulator for streaming
 	ToolCallsAccumulator map[int]*ToolCallAccumulator
+}
+
+type claudeUsageTokens struct {
+	InputTokens              int64
+	OutputTokens             int64
+	CacheCreationInputTokens int64
+	CacheReadInputTokens     int64
+	HasUsage                 bool
 }
 
 // ToolCallAccumulator holds the state for accumulating tool call data
@@ -36,16 +45,32 @@ type ToolCallAccumulator struct {
 	Arguments strings.Builder
 }
 
-func calculateClaudeUsageTokens(usage gjson.Result) (promptTokens, completionTokens, totalTokens, cachedTokens int64) {
-	inputTokens := usage.Get("input_tokens").Int()
-	completionTokens = usage.Get("output_tokens").Int()
-	cachedTokens = usage.Get("cache_read_input_tokens").Int()
-	cacheCreationInputTokens := usage.Get("cache_creation_input_tokens").Int()
+func (u *claudeUsageTokens) Merge(usage gjson.Result) {
+	if !usage.Exists() {
+		return
+	}
+	u.HasUsage = true
+	if inputTokens := usage.Get("input_tokens"); inputTokens.Exists() {
+		u.InputTokens = inputTokens.Int()
+	}
+	if outputTokens := usage.Get("output_tokens"); outputTokens.Exists() {
+		u.OutputTokens = outputTokens.Int()
+	}
+	if cacheCreationInputTokens := usage.Get("cache_creation_input_tokens"); cacheCreationInputTokens.Exists() {
+		u.CacheCreationInputTokens = cacheCreationInputTokens.Int()
+	}
+	if cacheReadInputTokens := usage.Get("cache_read_input_tokens"); cacheReadInputTokens.Exists() {
+		u.CacheReadInputTokens = cacheReadInputTokens.Int()
+	}
+}
 
-	promptTokens = inputTokens + cacheCreationInputTokens + cachedTokens
+func (u claudeUsageTokens) OpenAIUsage() (promptTokens, completionTokens, totalTokens, cachedTokens, cachedCreationTokens int64) {
+	cachedTokens = u.CacheReadInputTokens
+	cachedCreationTokens = u.CacheCreationInputTokens
+	promptTokens = u.InputTokens + cachedCreationTokens + cachedTokens
+	completionTokens = u.OutputTokens
 	totalTokens = promptTokens + completionTokens
-
-	return promptTokens, completionTokens, totalTokens, cachedTokens
+	return promptTokens, completionTokens, totalTokens, cachedTokens, cachedCreationTokens
 }
 
 // ConvertClaudeResponseToOpenAI converts Claude Code streaming response format to OpenAI Chat Completions format.
@@ -112,6 +137,7 @@ func ConvertClaudeResponseToOpenAI(_ context.Context, modelName string, original
 			if (*param).(*ConvertAnthropicResponseToOpenAIParams).ToolCallsAccumulator == nil {
 				(*param).(*ConvertAnthropicResponseToOpenAIParams).ToolCallsAccumulator = make(map[int]*ToolCallAccumulator)
 			}
+			(*param).(*ConvertAnthropicResponseToOpenAIParams).Usage.Merge(message.Get("usage"))
 		}
 		return [][]byte{template}
 
@@ -215,11 +241,13 @@ func ConvertClaudeResponseToOpenAI(_ context.Context, modelName string, original
 
 		// Handle usage information for token counts
 		if usage := root.Get("usage"); usage.Exists() {
-			promptTokens, completionTokens, totalTokens, cachedTokens := calculateClaudeUsageTokens(usage)
+			(*param).(*ConvertAnthropicResponseToOpenAIParams).Usage.Merge(usage)
+			promptTokens, completionTokens, totalTokens, cachedTokens, cachedCreationTokens := (*param).(*ConvertAnthropicResponseToOpenAIParams).Usage.OpenAIUsage()
 			template, _ = sjson.SetBytes(template, "usage.prompt_tokens", promptTokens)
 			template, _ = sjson.SetBytes(template, "usage.completion_tokens", completionTokens)
 			template, _ = sjson.SetBytes(template, "usage.total_tokens", totalTokens)
 			template, _ = sjson.SetBytes(template, "usage.prompt_tokens_details.cached_tokens", cachedTokens)
+			template, _ = sjson.SetBytes(template, "usage.prompt_tokens_details.cached_creation_tokens", cachedCreationTokens)
 		}
 		return [][]byte{template}
 
@@ -258,6 +286,8 @@ func mapAnthropicStopReasonToOpenAI(anthropicReason string) string {
 		return "length"
 	case "stop_sequence":
 		return "stop"
+	case "refusal", "sensitive":
+		return "content_filter"
 	default:
 		return "stop"
 	}
@@ -296,6 +326,7 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, origina
 	var stopReason string
 	var contentParts []string
 	var reasoningParts []string
+	usageTokens := claudeUsageTokens{}
 	toolCallsAccumulator := make(map[int]*ToolCallAccumulator)
 
 	for _, chunk := range chunks {
@@ -309,6 +340,7 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, origina
 				messageID = message.Get("id").String()
 				model = message.Get("model").String()
 				createdAt = time.Now().Unix()
+				usageTokens.Merge(message.Get("usage"))
 			}
 
 		case "content_block_start":
@@ -371,13 +403,18 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, origina
 				}
 			}
 			if usage := root.Get("usage"); usage.Exists() {
-				promptTokens, completionTokens, totalTokens, cachedTokens := calculateClaudeUsageTokens(usage)
-				out, _ = sjson.SetBytes(out, "usage.prompt_tokens", promptTokens)
-				out, _ = sjson.SetBytes(out, "usage.completion_tokens", completionTokens)
-				out, _ = sjson.SetBytes(out, "usage.total_tokens", totalTokens)
-				out, _ = sjson.SetBytes(out, "usage.prompt_tokens_details.cached_tokens", cachedTokens)
+				usageTokens.Merge(usage)
 			}
 		}
+	}
+
+	if usageTokens.HasUsage {
+		promptTokens, completionTokens, totalTokens, cachedTokens, cachedCreationTokens := usageTokens.OpenAIUsage()
+		out, _ = sjson.SetBytes(out, "usage.prompt_tokens", promptTokens)
+		out, _ = sjson.SetBytes(out, "usage.completion_tokens", completionTokens)
+		out, _ = sjson.SetBytes(out, "usage.total_tokens", totalTokens)
+		out, _ = sjson.SetBytes(out, "usage.prompt_tokens_details.cached_tokens", cachedTokens)
+		out, _ = sjson.SetBytes(out, "usage.prompt_tokens_details.cached_creation_tokens", cachedCreationTokens)
 	}
 
 	// Set basic response fields including message ID, creation time, and model
@@ -427,11 +464,11 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, origina
 		}
 		if toolCallsCount > 0 {
 			out, _ = sjson.SetBytes(out, "choices.0.finish_reason", "tool_calls")
-		} else {
-			out, _ = sjson.SetBytes(out, "choices.0.finish_reason", mapAnthropicStopReasonToOpenAI(stopReason))
+		} else if finishReason := mapAnthropicStopReasonToOpenAI(stopReason); finishReason != "stop" {
+			out, _ = sjson.SetBytes(out, "choices.0.finish_reason", finishReason)
 		}
-	} else {
-		out, _ = sjson.SetBytes(out, "choices.0.finish_reason", mapAnthropicStopReasonToOpenAI(stopReason))
+	} else if finishReason := mapAnthropicStopReasonToOpenAI(stopReason); finishReason != "stop" {
+		out, _ = sjson.SetBytes(out, "choices.0.finish_reason", finishReason)
 	}
 
 	return out

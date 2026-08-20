@@ -1,6 +1,54 @@
 package auth
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestRequestRetryOverride(t *testing.T) {
+	var unset *Auth
+	if got, ok := unset.RequestRetryOverride(); ok || got != 0 {
+		t.Fatalf("nil auth override = (%d, %t), want (0, false)", got, ok)
+	}
+
+	auth := &Auth{}
+	if got, ok := auth.RequestRetryOverride(); ok || got != 0 {
+		t.Fatalf("empty auth override = (%d, %t), want (0, false)", got, ok)
+	}
+
+	auth = &Auth{Metadata: map[string]any{"request_retry": 0}}
+	if got, ok := auth.RequestRetryOverride(); !ok || got != 0 {
+		t.Fatalf("request_retry=0 override = (%d, %t), want (0, true)", got, ok)
+	}
+
+	auth = &Auth{Metadata: map[string]any{"request_retry": 3}}
+	if got, ok := auth.RequestRetryOverride(); !ok || got != 3 {
+		t.Fatalf("request_retry=3 override = (%d, %t), want (3, true)", got, ok)
+	}
+
+	auth = &Auth{Metadata: map[string]any{"request_retry": -1}}
+	if got, ok := auth.RequestRetryOverride(); ok || got != 0 {
+		t.Fatalf("request_retry=-1 override = (%d, %t), want (0, false)", got, ok)
+	}
+
+	auth = &Auth{Metadata: map[string]any{"request-retry": 2}}
+	if got, ok := auth.RequestRetryOverride(); !ok || got != 2 {
+		t.Fatalf("request-retry=2 override = (%d, %t), want (2, true)", got, ok)
+	}
+
+	auth = &Auth{Metadata: map[string]any{"request-retry": -2}}
+	if got, ok := auth.RequestRetryOverride(); ok || got != 0 {
+		t.Fatalf("request-retry=-2 override = (%d, %t), want (0, false)", got, ok)
+	}
+
+	auth = &Auth{Metadata: map[string]any{"request_retry": "0"}}
+	if got, ok := auth.RequestRetryOverride(); !ok || got != 0 {
+		t.Fatalf("request_retry string 0 override = (%d, %t), want (0, true)", got, ok)
+	}
+}
 
 func TestToolPrefixDisabled(t *testing.T) {
 	var a *Auth
@@ -92,7 +140,108 @@ func TestEnsureIndexUsesCredentialIdentity(t *testing.T) {
 	if geminiIndex == altBaseIndex {
 		t.Fatalf("same provider/key with different base_url produced duplicate auth_index %q", geminiIndex)
 	}
-	if geminiIndex == duplicateIndex {
-		t.Fatalf("duplicate config entries should be separated by source-derived seed, got %q", geminiIndex)
+	if geminiIndex != duplicateIndex {
+		t.Fatalf("same provider/key with different source should share auth_index, got %q vs %q", geminiIndex, duplicateIndex)
+	}
+}
+
+func TestEnsureIndexUsesOAuthTypeAndAbsolutePath(t *testing.T) {
+	t.Parallel()
+
+	wd, errWd := os.Getwd()
+	if errWd != nil {
+		t.Fatalf("os.Getwd returned error: %v", errWd)
+	}
+
+	relPath := "test-oauth.json"
+	absPath := filepath.Join(wd, relPath)
+	expectedSeed := "antigravity:" + filepath.Clean(absPath)
+	expectedIndex := stableAuthIndex(expectedSeed)
+
+	a := &Auth{
+		Provider: "antigravity",
+		Attributes: map[string]string{
+			"path": relPath,
+		},
+		Metadata: map[string]any{
+			"type": "antigravity",
+		},
+	}
+
+	got := a.EnsureIndex()
+	if got == "" {
+		t.Fatal("auth index should not be empty")
+	}
+	if got != expectedIndex {
+		t.Fatalf("auth index = %q, want %q", got, expectedIndex)
+	}
+}
+
+func TestRecentRequestsSnapshotEmptyReturnsTwentyBuckets(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).In(time.Local)
+	a := &Auth{}
+
+	got := a.RecentRequestsSnapshot(now)
+	if len(got) != recentRequestBucketCount {
+		t.Fatalf("len = %d, want %d", len(got), recentRequestBucketCount)
+	}
+
+	currentBucketID := now.Unix() / recentRequestBucketSeconds
+	baseBucketID := currentBucketID - int64(recentRequestBucketCount-1)
+	for i, bucket := range got {
+		if bucket.Success != 0 || bucket.Failed != 0 {
+			t.Fatalf("bucket[%d] counts = %d/%d, want 0/0", i, bucket.Success, bucket.Failed)
+		}
+		if strings.TrimSpace(bucket.Time) == "" {
+			t.Fatalf("bucket[%d] time label is empty", i)
+		}
+		expectedBucketID := baseBucketID + int64(i)
+		start := time.Unix(expectedBucketID*recentRequestBucketSeconds, 0).In(time.Local)
+		end := start.Add(10 * time.Minute)
+		expected := start.Format("15:04") + "-" + end.Format("15:04")
+		if bucket.Time != expected {
+			t.Fatalf("bucket[%d] time = %q, want %q", i, bucket.Time, expected)
+		}
+	}
+}
+
+func TestRecentRequestsSnapshotIncludesCounts(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).In(time.Local)
+	a := &Auth{}
+
+	a.recordRecentRequest(now, true)
+	a.recordRecentRequest(now, false)
+
+	got := a.RecentRequestsSnapshot(now)
+	if len(got) != recentRequestBucketCount {
+		t.Fatalf("len = %d, want %d", len(got), recentRequestBucketCount)
+	}
+
+	newest := got[len(got)-1]
+	if newest.Success != 1 || newest.Failed != 1 {
+		t.Fatalf("newest bucket = success=%d failed=%d, want 1/1", newest.Success, newest.Failed)
+	}
+}
+
+func TestRecentRequestsSnapshotBucketAdvanceMovesCounts(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).In(time.Local)
+	next := now.Add(10 * time.Minute)
+	a := &Auth{}
+
+	a.recordRecentRequest(now, true)
+	a.recordRecentRequest(next, false)
+
+	got := a.RecentRequestsSnapshot(next)
+	if len(got) != recentRequestBucketCount {
+		t.Fatalf("len = %d, want %d", len(got), recentRequestBucketCount)
+	}
+
+	secondNewest := got[len(got)-2]
+	newest := got[len(got)-1]
+	if secondNewest.Success != 1 || secondNewest.Failed != 0 {
+		t.Fatalf("second newest bucket = success=%d failed=%d, want 1/0", secondNewest.Success, secondNewest.Failed)
+	}
+	if newest.Success != 0 || newest.Failed != 1 {
+		t.Fatalf("newest bucket = success=%d failed=%d, want 0/1", newest.Success, newest.Failed)
 	}
 }

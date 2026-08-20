@@ -1,41 +1,44 @@
 package openai
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"fmt"
+	"errors"
+	"net"
 	"net/http"
-	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
 const (
-	wsRequestTypeCreate  = "response.create"
-	wsRequestTypeAppend  = "response.append"
-	wsEventTypeError     = "error"
-	wsEventTypeCompleted = "response.completed"
-	wsDoneMarker         = "[DONE]"
-	wsTurnStateHeader    = "x-codex-turn-state"
-	wsRequestBodyKey     = "REQUEST_BODY_OVERRIDE"
-	wsPayloadLogMaxSize  = 2048
-	wsBodyLogMaxSize     = 64 * 1024
-	wsBodyLogTruncated   = "\n[websocket log truncated]\n"
+	wsRequestTypeCreate                   = "response.create"
+	wsRequestTypeAppend                   = "response.append"
+	wsEventTypeError                      = "error"
+	wsEventTypeCompleted                  = "response.completed"
+	wsEventTypeDone                       = "response.done"
+	wsDoneMarker                          = "[DONE]"
+	wsTurnStateHeader                     = "x-codex-turn-state"
+	wsTimelineBodyKey                     = "WEBSOCKET_TIMELINE_OVERRIDE"
+	wsCloseReasonMaxBytes                 = 123
+	wsHTTPReplayRequiredCloseReason       = "upstream requires HTTP replay"
+	responsesWebsocketUpstreamModeUnknown = ""
+	responsesWebsocketUpstreamModeWS      = "websocket"
+	responsesWebsocketUpstreamModeHTTP    = "http"
+
+	codexLocalCompactionSummaryPrefix = "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:"
 )
 
 var responsesWebsocketUpgrader = websocket.Upgrader{
@@ -46,6 +49,205 @@ var responsesWebsocketUpgrader = websocket.Upgrader{
 	},
 }
 
+// writeWebsocketCloseForUpstreamError mirrors transport-level upstream close
+// codes to the downstream WebSocket client before the connection is torn down.
+// Without this the client only observes an abnormal closure (1006) and cannot
+// apply its own close-code based handling (e.g. falling back to SSE on 1009).
+func writeWebsocketCloseForUpstreamError(conn *websocket.Conn, err error) (bool, error) {
+	if conn == nil {
+		return false, nil
+	}
+	matched, payload := websocketClosePayloadForUpstreamError(err)
+	if !matched {
+		return false, nil
+	}
+	return true, conn.WriteControl(websocket.CloseMessage, payload, time.Time{})
+}
+
+func websocketClosePayloadForUpstreamError(err error) (bool, []byte) {
+	if err == nil {
+		return false, nil
+	}
+
+	errText := err.Error()
+	if cliproxyexecutor.IsUpstreamWebsocketReplayRequired(err) {
+		return true, websocket.FormatCloseMessage(
+			websocket.CloseServiceRestart,
+			truncateWebsocketCloseReason(wsHTTPReplayRequiredCloseReason, wsCloseReasonMaxBytes),
+		)
+	}
+
+	code := 0
+	reason := ""
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) && closeErr.Code == websocket.CloseMessageTooBig {
+		code = closeErr.Code
+		reason = closeErr.Text
+	} else {
+		type statusCoder interface {
+			StatusCode() int
+		}
+		var statusErr statusCoder
+		if !errors.As(err, &statusErr) || statusErr.StatusCode() != http.StatusRequestEntityTooLarge ||
+			gjson.Get(errText, "error.code").String() != "message_too_big" {
+			return false, nil
+		}
+		code = websocket.CloseMessageTooBig
+		reason = strings.TrimSpace(gjson.Get(errText, "error.message").String())
+	}
+	if reason == "" {
+		reason = "message too big"
+	}
+	reason = truncateWebsocketCloseReason(reason, wsCloseReasonMaxBytes)
+	return true, websocket.FormatCloseMessage(code, reason)
+}
+
+type responsesWebsocketWriter struct {
+	conn    *websocket.Conn
+	writeMu sync.Mutex
+	closing atomic.Bool
+}
+
+func newResponsesWebsocketWriter(conn *websocket.Conn) *responsesWebsocketWriter {
+	return &responsesWebsocketWriter{conn: conn}
+}
+
+// closeForUpstreamError sends a best-effort close frame without waiting behind
+// an active downstream data writer. If a data write already owns writeMu, the
+// connection is closed immediately so the blocked writer and session can exit.
+func (w *responsesWebsocketWriter) closeForUpstreamError(err error) (bool, error) {
+	if w == nil || w.conn == nil {
+		return false, nil
+	}
+	matched, payload := websocketClosePayloadForUpstreamError(err)
+	if !matched {
+		return false, nil
+	}
+	if !w.closing.CompareAndSwap(false, true) {
+		return true, nil
+	}
+	if !w.writeMu.TryLock() {
+		return true, w.conn.Close()
+	}
+	defer w.writeMu.Unlock()
+
+	errWrite := w.conn.WriteControl(websocket.CloseMessage, payload, time.Time{})
+	errClose := w.conn.Close()
+	if errWrite != nil {
+		return true, errWrite
+	}
+	return true, errClose
+}
+
+func (w *responsesWebsocketWriter) closeWithoutError() (bool, error) {
+	if w == nil || w.conn == nil {
+		return false, nil
+	}
+	if !w.closing.CompareAndSwap(false, true) {
+		return false, nil
+	}
+	return true, w.conn.Close()
+}
+
+func (w *responsesWebsocketWriter) closeWithPayload(payload []byte) (bool, error) {
+	if w == nil || w.conn == nil {
+		return false, nil
+	}
+	if !w.closing.CompareAndSwap(false, true) {
+		return false, nil
+	}
+	if !w.writeMu.TryLock() {
+		return false, w.conn.Close()
+	}
+	defer w.writeMu.Unlock()
+
+	errWrite := w.conn.WriteMessage(websocket.TextMessage, payload)
+	errClose := w.conn.Close()
+	if errWrite != nil {
+		return false, errWrite
+	}
+	return true, errClose
+}
+
+func (w *responsesWebsocketWriter) closeForUpstreamDisconnect(err error) {
+	if w == nil || w.conn == nil {
+		return
+	}
+	if matched, _ := w.closeForUpstreamError(err); matched {
+		return
+	}
+
+	errMsg := handlers.ExecutionErrorMessage(err)
+	if !shouldExposeResponsesUpstreamError(errMsg) {
+		_, _ = w.closeWithoutError()
+		return
+	}
+	payload, errBuild := buildResponsesWebsocketErrorPayload(errMsg)
+	if errBuild != nil {
+		_, _ = w.closeWithoutError()
+		return
+	}
+	wrote, errClose := w.closeWithPayload(payload)
+	if wrote {
+		log.Infof(
+			"responses websocket: downstream_out disconnect_error event=%s payload=%s",
+			websocketPayloadEventType(payload),
+			websocketPayloadPreview(payload),
+		)
+	}
+	if errClose != nil && !errors.Is(errClose, websocket.ErrCloseSent) {
+		log.Debugf("responses websocket: upstream disconnect close failed: %v", errClose)
+	}
+}
+
+// isWebsocketConnectionClosedError reports whether the error only means the
+// connection was already torn down. These are expected during shutdown races
+// (the proxy closes after sending a terminal frame, or the client hangs up mid
+// write) and must not be logged as proxy failures.
+func isWebsocketConnectionClosedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, websocket.ErrCloseSent) {
+		return true
+	}
+	return strings.Contains(err.Error(), "use of closed network connection")
+}
+
+func truncateWebsocketCloseReason(reason string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(reason) <= maxBytes && utf8.ValidString(reason) {
+		return reason
+	}
+
+	// Decode from the front so work and output stay bounded by maxBytes.
+	var truncated strings.Builder
+	truncated.Grow(min(len(reason), maxBytes))
+	remaining := maxBytes
+	runeErrorSize := utf8.RuneLen(utf8.RuneError)
+	for len(reason) > 0 && remaining > 0 {
+		r, size := utf8.DecodeRuneInString(reason)
+		if r == utf8.RuneError && size == 1 {
+			if runeErrorSize > remaining {
+				break
+			}
+			truncated.WriteRune(utf8.RuneError)
+			reason = reason[1:]
+			remaining -= runeErrorSize
+			continue
+		}
+		if size > remaining {
+			break
+		}
+		truncated.WriteString(reason[:size])
+		reason = reason[size:]
+		remaining -= size
+	}
+	return truncated.String()
+}
+
 // ResponsesWebsocket handles websocket requests for /v1/responses.
 // It accepts `response.create` and `response.append` requests and streams
 // response events back as JSON websocket text messages.
@@ -54,16 +256,49 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	if err != nil {
 		return
 	}
+	writer := newResponsesWebsocketWriter(conn)
 	passthroughSessionID := uuid.NewString()
-	clientRemoteAddr := ""
-	if c != nil && c.Request != nil {
-		clientRemoteAddr = strings.TrimSpace(c.Request.RemoteAddr)
+	downstreamSessionKey := websocketDownstreamSessionKey(c.Request)
+	retainResponsesWebsocketToolCaches(downstreamSessionKey)
+	clientIP := websocketClientAddress(c)
+	log.Infof("responses websocket: client connected id=%s remote=%s", passthroughSessionID, clientIP)
+
+	requestLogEnabled := h != nil && h.Cfg != nil && h.Cfg.RequestLog
+	wsTimelineLog := newWebsocketTimelineLog(requestLogEnabled, websocketTimelineSourceFromContext(c))
+
+	wsDone := make(chan struct{})
+	defer close(wsDone)
+
+	if h != nil && h.AuthManager != nil {
+		type upstreamDisconnectSubscriber interface {
+			UpstreamDisconnectChan(sessionID string) <-chan error
+		}
+		for _, provider := range []string{"codex", "xai"} {
+			exec, ok := h.AuthManager.Executor(provider)
+			if !ok || exec == nil {
+				continue
+			}
+			if subscriber, ok := exec.(upstreamDisconnectSubscriber); ok && subscriber != nil {
+				disconnectCh := subscriber.UpstreamDisconnectChan(passthroughSessionID)
+				if disconnectCh != nil {
+					go func() {
+						select {
+						case <-wsDone:
+							return
+						case disconnectErr := <-disconnectCh:
+							writer.closeForUpstreamDisconnect(disconnectErr)
+						}
+					}()
+				}
+			}
+		}
 	}
-	log.Infof("responses websocket: client connected id=%s remote=%s", passthroughSessionID, clientRemoteAddr)
+
 	var wsTerminateErr error
-	var wsBodyLog strings.Builder
 	defer func() {
+		releaseResponsesWebsocketToolCaches(downstreamSessionKey)
 		if wsTerminateErr != nil {
+			appendWebsocketTimelineDisconnect(wsTimelineLog, wsTerminateErr, time.Now())
 			// log.Infof("responses websocket: session closing id=%s reason=%v", passthroughSessionID, wsTerminateErr)
 		} else {
 			log.Infof("responses websocket: session closing id=%s", passthroughSessionID)
@@ -72,21 +307,75 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			h.AuthManager.CloseExecutionSession(passthroughSessionID)
 			log.Infof("responses websocket: upstream execution session closed id=%s", passthroughSessionID)
 		}
-		setWebsocketRequestBody(c, wsBodyLog.String())
-		if errClose := conn.Close(); errClose != nil {
+		wsTimelineLog.SetContext(c)
+		if errClose := conn.Close(); errClose != nil && !isWebsocketConnectionClosedError(errClose) {
 			log.Warnf("responses websocket: close connection error: %v", errClose)
 		}
 	}()
 
 	var lastRequest []byte
 	lastResponseOutput := []byte("[]")
+	lastResponseID := ""
+	var lastResponsePendingToolCallIDs []string
 	pinnedAuthID := ""
+	// Preserve independent upstream auth affinity when a downstream session switches providers.
+	pinnedAuthByProvider := make(map[string]responsesWebsocketPinnedAuthState)
+	passthroughModelName := ""
+	upstreamMode := responsesWebsocketUpstreamModeUnknown
+	upstreamWebsocketAuthID := ""
+	sessionAuthByIDWithSource := func(authID string) (*coreauth.Auth, bool, bool) {
+		if h == nil || h.AuthManager == nil {
+			return nil, false, false
+		}
+		// Prefer the current manager view so hot-reloaded transport eligibility is
+		// observed even when the execution session still holds an older auth snapshot.
+		if auth, ok := h.AuthManager.GetByID(authID); ok {
+			return auth, false, true
+		}
+		if auth, ok := h.AuthManager.GetExecutionSessionAuthByID(passthroughSessionID, authID); ok {
+			return auth, true, true
+		}
+		return nil, false, false
+	}
+	sessionAuthByID := func(authID string) (*coreauth.Auth, bool) {
+		auth, _, ok := sessionAuthByIDWithSource(authID)
+		return auth, ok
+	}
+	upstreamModeForAuth := func(auth *coreauth.Auth) string {
+		if auth != nil && websocketUpstreamSupportsIncrementalInput(auth.Attributes, auth.Metadata) {
+			provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+			if provider == "codex" || provider == "xai" {
+				return responsesWebsocketUpstreamModeWS
+			}
+		}
+		return responsesWebsocketUpstreamModeHTTP
+	}
+	rememberPinnedAuth := func(authID string, modelName string) {
+		authID = strings.TrimSpace(authID)
+		auth, ok := sessionAuthByID(authID)
+		if authID == "" || !ok || auth == nil {
+			return
+		}
+		pinnedAuthID = authID
+		providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
+		_, modelKey := responsesWebsocketProviderSetForModel(responsesWebsocketResolvedModelName(modelName))
+		if providerKey != "" {
+			pinnedAuthByProvider[providerKey] = responsesWebsocketPinnedAuthState{authID: authID, modelKey: modelKey}
+		}
+	}
+	forgetPinnedAuth := func() {
+		for providerKey, state := range pinnedAuthByProvider {
+			if state.authID == pinnedAuthID {
+				delete(pinnedAuthByProvider, providerKey)
+			}
+		}
+		pinnedAuthID = ""
+	}
 
 	for {
 		msgType, payload, errReadMessage := conn.ReadMessage()
 		if errReadMessage != nil {
 			wsTerminateErr = errReadMessage
-			appendWebsocketEvent(&wsBodyLog, "disconnect", []byte(errReadMessage.Error()))
 			if websocket.IsCloseError(errReadMessage, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived) {
 				log.Infof("responses websocket: client disconnected id=%s error=%v", passthroughSessionID, errReadMessage)
 			} else {
@@ -104,35 +393,115 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		// 	websocketPayloadEventType(payload),
 		// 	websocketPayloadPreview(payload),
 		// )
-		appendWebsocketEvent(&wsBodyLog, "request", payload)
+		wsTimelineLog.BeginRequest()
+		wsTimelineLog.Append("request", payload, time.Now())
 
-		allowIncrementalInputWithPreviousResponseID := false
-		if pinnedAuthID != "" && h != nil && h.AuthManager != nil {
-			if pinnedAuth, ok := h.AuthManager.GetByID(pinnedAuthID); ok && pinnedAuth != nil {
-				allowIncrementalInputWithPreviousResponseID = websocketUpstreamSupportsIncrementalInput(pinnedAuth.Attributes, pinnedAuth.Metadata)
+		explicitRequestModelName := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
+		requestModelName := explicitRequestModelName
+		if requestModelName == "" {
+			requestModelName = passthroughModelName
+		}
+		if requestModelName == "" {
+			requestModelName = strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
+		}
+		executionParent := context.WithValue(c.Request.Context(), "gin", c)
+		executionParent, routeOverridesModelResolution := h.PrepareStreamModelRoute(
+			executionParent,
+			h.HandlerType(),
+			requestModelName,
+			payload,
+		)
+		if pinnedAuthID != "" {
+			pinnedAuth, homeRuntime, ok := sessionAuthByIDWithSource(pinnedAuthID)
+			providerKey := ""
+			if pinnedAuth != nil {
+				providerKey = strings.ToLower(strings.TrimSpace(pinnedAuth.Provider))
 			}
-		} else {
-			requestModelName := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
-			if requestModelName == "" {
-				requestModelName = strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
+			state, hasState := pinnedAuthByProvider[providerKey]
+			if !ok || !hasState || state.authID != pinnedAuthID || !responsesWebsocketPinnedAuthMatchesModel(pinnedAuth, requestModelName, state.modelKey, homeRuntime) {
+				pinnedAuthID = ""
 			}
-			allowIncrementalInputWithPreviousResponseID = h.websocketUpstreamSupportsIncrementalInputForModel(requestModelName)
+		}
+		if pinnedAuthID == "" {
+			providerSet, _ := responsesWebsocketProviderSetForModel(responsesWebsocketResolvedModelName(requestModelName))
+			if len(providerSet) == 1 {
+				for providerKey := range providerSet {
+					state, ok := pinnedAuthByProvider[providerKey]
+					candidateAuth, homeRuntime, okAuth := sessionAuthByIDWithSource(state.authID)
+					if ok && okAuth && responsesWebsocketPinnedAuthMatchesModel(candidateAuth, requestModelName, state.modelKey, homeRuntime) {
+						pinnedAuthID = state.authID
+					} else {
+						delete(pinnedAuthByProvider, providerKey)
+					}
+				}
+			}
+		}
+		useUpstreamWebsocketPassthrough := h.responsesWebsocketUsesUpstreamWebsocketPassthrough(requestModelName)
+		if pinnedAuthID != "" {
+			if pinnedAuth, ok := sessionAuthByID(pinnedAuthID); ok && responsesWebsocketAuthSupportsIncrementalInput(pinnedAuth) {
+				provider := strings.ToLower(strings.TrimSpace(pinnedAuth.Provider))
+				useUpstreamWebsocketPassthrough = provider == "codex" || provider == "xai"
+			}
+		}
+		nativeWebsocketPassthrough := !routeOverridesModelResolution && responsesWebsocketNativePassthroughAllowed(
+			upstreamMode,
+			useUpstreamWebsocketPassthrough,
+			pinnedAuthID,
+			upstreamWebsocketAuthID,
+		)
+		requestRequiresCurrentUpstreamWebsocket := responsesWebsocketRequestRequiresCurrentUpstream(payload)
+		if upstreamMode == responsesWebsocketUpstreamModeWS && !nativeWebsocketPassthrough {
+			if requestRequiresCurrentUpstreamWebsocket {
+				replayErr := responsesWebsocketHTTPReplayRequiredError()
+				wsTerminateErr = replayErr
+				matched, errClose := writer.closeForUpstreamError(replayErr)
+				if !matched {
+					_ = conn.Close()
+				} else if errClose != nil && !errors.Is(errClose, websocket.ErrCloseSent) {
+					log.Debugf("responses websocket: replay close failed id=%s error=%v", passthroughSessionID, errClose)
+				}
+				return
+			}
+			// A full response.create is already a self-contained reset and can safely
+			// establish a new upstream transport without another replay.
+		}
+		if explicitRequestModelName != "" && !useUpstreamWebsocketPassthrough {
+			passthroughModelName = ""
+		}
+
+		allowCompactionReplayBypass := false
+		if !nativeWebsocketPassthrough {
+			if pinnedAuthID != "" {
+				if pinnedAuth, ok := sessionAuthByID(pinnedAuthID); ok && pinnedAuth != nil {
+					allowCompactionReplayBypass = responsesWebsocketAuthSupportsCompactionReplay(pinnedAuth)
+				}
+			} else {
+				allowCompactionReplayBypass = h.websocketUpstreamSupportsCompactionReplayForModel(requestModelName)
+			}
 		}
 
 		var requestJSON []byte
 		var updatedLastRequest []byte
 		var errMsg *interfaces.ErrorMessage
-		requestJSON, updatedLastRequest, errMsg = normalizeResponsesWebsocketRequestWithMode(
-			payload,
-			lastRequest,
-			lastResponseOutput,
-			allowIncrementalInputWithPreviousResponseID,
-		)
+		if nativeWebsocketPassthrough {
+			requestJSON, errMsg = normalizeResponsesWebsocketPassthroughRequest(payload, requestModelName)
+		} else if len(lastRequest) == 0 && strings.TrimSpace(gjson.GetBytes(payload, "previous_response_id").String()) != "" {
+			errMsg = responsesWebsocketPreviousResponseNotFoundError()
+		} else {
+			requestJSON, updatedLastRequest, errMsg = normalizeResponsesWebsocketRequestWithIncrementalState(
+				payload,
+				lastRequest,
+				lastResponseOutput,
+				lastResponseID,
+				lastResponsePendingToolCallIDs,
+				false,
+				allowCompactionReplayBypass,
+			)
+		}
 		if errMsg != nil {
 			h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
 			markAPIResponseTimestamp(c)
-			errorPayload, errWrite := writeResponsesWebsocketError(conn, errMsg)
-			appendWebsocketEvent(&wsBodyLog, "response", errorPayload)
+			errorPayload, errWrite := writeResponsesWebsocketError(writer, wsTimelineLog, errMsg)
 			log.Infof(
 				"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
 				passthroughSessionID,
@@ -151,7 +520,10 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			}
 			continue
 		}
-		if shouldHandleResponsesWebsocketPrewarmLocally(payload, lastRequest, allowIncrementalInputWithPreviousResponseID) {
+
+		requestJSON = h.prepareCodexMultiAgentV2Tools(c, requestJSON)
+
+		if !useUpstreamWebsocketPassthrough && shouldHandleResponsesWebsocketPrewarmLocally(payload, lastRequest, false) {
 			if updated, errDelete := sjson.DeleteBytes(requestJSON, "generate"); errDelete == nil {
 				requestJSON = updated
 			}
@@ -160,47 +532,152 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			}
 			lastRequest = updatedLastRequest
 			lastResponseOutput = []byte("[]")
-			if errWrite := writeResponsesWebsocketSyntheticPrewarm(c, conn, requestJSON, &wsBodyLog, passthroughSessionID); errWrite != nil {
+			lastResponseID = ""
+			lastResponsePendingToolCallIDs = nil
+			if errWrite := writeResponsesWebsocketSyntheticPrewarm(c, writer, requestJSON, wsTimelineLog, passthroughSessionID); errWrite != nil {
 				wsTerminateErr = errWrite
-				appendWebsocketEvent(&wsBodyLog, "disconnect", []byte(errWrite.Error()))
 				return
 			}
 			continue
 		}
-		lastRequest = updatedLastRequest
+
+		var toolCacheTurn *responsesWebsocketToolCacheTurn
+		nextLastRequest := lastRequest
+		if nativeWebsocketPassthrough {
+			if modelName := strings.TrimSpace(gjson.GetBytes(requestJSON, "model").String()); modelName != "" {
+				passthroughModelName = modelName
+			}
+		} else {
+			requestJSON, toolCacheTurn = prepareResponsesWebsocketFallbackTurn(downstreamSessionKey, requestJSON)
+			nextLastRequest = requestJSON
+		}
 
 		modelName := gjson.GetBytes(requestJSON, "model").String()
-		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+		lastAttemptedAuthID := pinnedAuthID
+		attemptedUpstreamMode := responsesWebsocketUpstreamModeUnknown
+		selectedAuthObserved := false
+		pinnedAuthAttempted := false
+		cliCtx, cliCancel := h.GetContextWithCancel(h, c, executionParent)
 		cliCtx = cliproxyexecutor.WithDownstreamWebsocket(cliCtx)
+		if nativeWebsocketPassthrough && requestRequiresCurrentUpstreamWebsocket {
+			cliCtx = cliproxyexecutor.WithRequiredUpstreamWebsocket(cliCtx)
+		}
 		cliCtx = handlers.WithExecutionSessionID(cliCtx, passthroughSessionID)
-		if pinnedAuthID != "" {
+		cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, func(authID string) {
+			authID = strings.TrimSpace(authID)
+			if authID == "" || h == nil || h.AuthManager == nil {
+				return
+			}
+			lastAttemptedAuthID = authID
+			selectedAuthObserved = true
+			pinnedAuthAttempted = pinnedAuthAttempted || (pinnedAuthID != "" && authID == pinnedAuthID)
+			selectedAuth, ok := sessionAuthByID(authID)
+			if !ok || selectedAuth == nil {
+				return
+			}
+			attemptedUpstreamMode = upstreamModeForAuth(selectedAuth)
+		})
+		if pinnedAuthID != "" && !routeOverridesModelResolution {
 			cliCtx = handlers.WithPinnedAuthID(cliCtx, pinnedAuthID)
-		} else {
-			cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, func(authID string) {
-				authID = strings.TrimSpace(authID)
-				if authID == "" || h == nil || h.AuthManager == nil {
-					return
-				}
-				selectedAuth, ok := h.AuthManager.GetByID(authID)
-				if !ok || selectedAuth == nil {
-					return
-				}
-				if websocketUpstreamSupportsIncrementalInput(selectedAuth.Attributes, selectedAuth.Metadata) {
-					pinnedAuthID = authID
-				}
-			})
 		}
 		dataChan, _, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
+		if !selectedAuthObserved {
+			// Plugin/alternate routes bypass auth selection. Keep canonical HTTP-mode
+			// state instead of inheriting the previous pinned websocket mode.
+			attemptedUpstreamMode = responsesWebsocketUpstreamModeHTTP
+		}
+		// A connection-scoped continuation cannot rotate credentials in place. Suppress
+		// credential errors and make the client replay the full turn on a new socket.
+		replayPinnedAuthFailure := func(errMsg *interfaces.ErrorMessage) bool {
+			return nativeWebsocketPassthrough && requestRequiresCurrentUpstreamWebsocket && pinnedAuthAttempted &&
+				shouldReplayResponsesWebsocketPinnedAuthFailure(errMsg)
+		}
 
-		completedOutput, errForward := h.forwardResponsesWebsocket(c, conn, cliCancel, dataChan, errChan, &wsBodyLog, passthroughSessionID)
+		completedOutput, completedResponseID, completedPendingToolCallIDs, forwardErrMsg, errForward := h.forwardResponsesWebsocket(
+			c,
+			writer,
+			cliCancel,
+			dataChan,
+			errChan,
+			wsTimelineLog,
+			passthroughSessionID,
+			responsesWebsocketForwardOptions{
+				toolCacheTurn: toolCacheTurn,
+				suppressError: replayPinnedAuthFailure,
+			},
+		)
 		if errForward != nil {
 			wsTerminateErr = errForward
-			appendWebsocketEvent(&wsBodyLog, "disconnect", []byte(errForward.Error()))
-			log.Warnf("responses websocket: forward failed id=%s error=%v", passthroughSessionID, errForward)
+			switch {
+			case errors.Is(errForward, websocket.ErrCloseSent):
+			case isWebsocketConnectionClosedError(errForward):
+				// The client hung up while a downstream write was in flight. This is a
+				// normal shutdown race, not a proxy failure.
+				log.Debugf("responses websocket: client closed during forward id=%s error=%v", passthroughSessionID, errForward)
+			default:
+				log.Warnf("responses websocket: forward failed id=%s error=%v", passthroughSessionID, errForward)
+			}
 			return
 		}
-		lastResponseOutput = completedOutput
+		if forwardErrMsg != nil {
+			if pinnedAuthAttempted && shouldReleaseResponsesWebsocketPinnedAuth(forwardErrMsg) {
+				forgetPinnedAuth()
+			}
+			if replayPinnedAuthFailure(forwardErrMsg) {
+				replayErr := responsesWebsocketHTTPReplayRequiredError()
+				wsTerminateErr = replayErr
+				matched, errClose := writer.closeForUpstreamError(replayErr)
+				if !matched {
+					_ = conn.Close()
+				} else if errClose != nil && !errors.Is(errClose, websocket.ErrCloseSent) {
+					log.Debugf("responses websocket: credential replay close failed id=%s error=%v", passthroughSessionID, errClose)
+				}
+				return
+			}
+			continue
+		}
+
+		toolCacheTurn.commit()
+		upstreamMode = attemptedUpstreamMode
+		if upstreamMode == responsesWebsocketUpstreamModeWS {
+			upstreamWebsocketAuthID = lastAttemptedAuthID
+			if lastAttemptedAuthID != "" {
+				rememberPinnedAuth(lastAttemptedAuthID, modelName)
+			}
+			passthroughModelName = modelName
+			lastRequest = nil
+			lastResponseOutput = []byte("[]")
+			lastResponseID = ""
+			lastResponsePendingToolCallIDs = nil
+		} else {
+			upstreamWebsocketAuthID = ""
+			lastRequest = nextLastRequest
+			lastResponseOutput = completedOutput
+			lastResponseID = strings.TrimSpace(completedResponseID)
+			lastResponsePendingToolCallIDs = append([]string(nil), completedPendingToolCallIDs...)
+		}
 	}
+}
+
+func responsesWebsocketHTTPReplayRequiredError() error {
+	return cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
+}
+
+func responsesWebsocketRequestRequiresCurrentUpstream(payload []byte) bool {
+	return strings.TrimSpace(gjson.GetBytes(payload, "previous_response_id").String()) != "" ||
+		strings.TrimSpace(gjson.GetBytes(payload, "type").String()) == wsRequestTypeAppend
+}
+
+func responsesWebsocketNativePassthroughAllowed(upstreamMode string, useUpstreamWebsocket bool, pinnedAuthID string, upstreamAuthID string) bool {
+	return upstreamMode == responsesWebsocketUpstreamModeWS && useUpstreamWebsocket &&
+		strings.TrimSpace(pinnedAuthID) != "" && strings.TrimSpace(pinnedAuthID) == strings.TrimSpace(upstreamAuthID)
+}
+
+func websocketClientAddress(c *gin.Context) string {
+	if c == nil || c.Request == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.ClientIP())
 }
 
 func websocketUpgradeHeaders(req *http.Request) http.Header {
@@ -217,735 +694,11 @@ func websocketUpgradeHeaders(req *http.Request) http.Header {
 	return headers
 }
 
-func normalizeResponsesWebsocketRequest(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte) ([]byte, []byte, *interfaces.ErrorMessage) {
-	return normalizeResponsesWebsocketRequestWithMode(rawJSON, lastRequest, lastResponseOutput, true)
-}
-
-func normalizeResponsesWebsocketRequestWithMode(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte, allowIncrementalInputWithPreviousResponseID bool) ([]byte, []byte, *interfaces.ErrorMessage) {
-	requestType := strings.TrimSpace(gjson.GetBytes(rawJSON, "type").String())
-	switch requestType {
-	case wsRequestTypeCreate:
-		// log.Infof("responses websocket: response.create request")
-		if len(lastRequest) == 0 {
-			return normalizeResponseCreateRequest(rawJSON)
-		}
-		return normalizeResponseSubsequentRequest(rawJSON, lastRequest, lastResponseOutput, allowIncrementalInputWithPreviousResponseID)
-	case wsRequestTypeAppend:
-		// log.Infof("responses websocket: response.append request")
-		return normalizeResponseSubsequentRequest(rawJSON, lastRequest, lastResponseOutput, allowIncrementalInputWithPreviousResponseID)
-	default:
-		return nil, lastRequest, &interfaces.ErrorMessage{
-			StatusCode: http.StatusBadRequest,
-			Error:      fmt.Errorf("unsupported websocket request type: %s", requestType),
-		}
+func responsesWebsocketPreviousResponseNotFoundError() *interfaces.ErrorMessage {
+	return &interfaces.ErrorMessage{
+		StatusCode: http.StatusConflict,
+		Error: errors.New(
+			`{"error":{"message":"Previous response is not available on this websocket; resend the full conversation input without previous_response_id","type":"invalid_request_error","code":"previous_response_not_found","param":"previous_response_id"}}`,
+		),
 	}
-}
-
-func normalizeResponseCreateRequest(rawJSON []byte) ([]byte, []byte, *interfaces.ErrorMessage) {
-	normalized, errDelete := sjson.DeleteBytes(rawJSON, "type")
-	if errDelete != nil {
-		normalized = bytes.Clone(rawJSON)
-	}
-	normalized, _ = sjson.SetBytes(normalized, "stream", true)
-	if !gjson.GetBytes(normalized, "input").Exists() {
-		normalized, _ = sjson.SetRawBytes(normalized, "input", []byte("[]"))
-	}
-
-	modelName := strings.TrimSpace(gjson.GetBytes(normalized, "model").String())
-	if modelName == "" {
-		return nil, nil, &interfaces.ErrorMessage{
-			StatusCode: http.StatusBadRequest,
-			Error:      fmt.Errorf("missing model in response.create request"),
-		}
-	}
-	return normalized, bytes.Clone(normalized), nil
-}
-
-func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte, allowIncrementalInputWithPreviousResponseID bool) ([]byte, []byte, *interfaces.ErrorMessage) {
-	if len(lastRequest) == 0 {
-		return nil, lastRequest, &interfaces.ErrorMessage{
-			StatusCode: http.StatusBadRequest,
-			Error:      fmt.Errorf("websocket request received before response.create"),
-		}
-	}
-
-	nextInput := gjson.GetBytes(rawJSON, "input")
-	if !nextInput.Exists() || !nextInput.IsArray() {
-		return nil, lastRequest, &interfaces.ErrorMessage{
-			StatusCode: http.StatusBadRequest,
-			Error:      fmt.Errorf("websocket request requires array field: input"),
-		}
-	}
-
-	// Websocket v2 mode uses response.create with previous_response_id + incremental input.
-	// Do not expand it into a full input transcript; upstream expects the incremental payload.
-	if allowIncrementalInputWithPreviousResponseID {
-		if prev := strings.TrimSpace(gjson.GetBytes(rawJSON, "previous_response_id").String()); prev != "" {
-			normalized, errDelete := sjson.DeleteBytes(rawJSON, "type")
-			if errDelete != nil {
-				normalized = bytes.Clone(rawJSON)
-			}
-			if !gjson.GetBytes(normalized, "model").Exists() {
-				modelName := strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
-				if modelName != "" {
-					normalized, _ = sjson.SetBytes(normalized, "model", modelName)
-				}
-			}
-			if !gjson.GetBytes(normalized, "instructions").Exists() {
-				instructions := gjson.GetBytes(lastRequest, "instructions")
-				if instructions.Exists() {
-					normalized, _ = sjson.SetRawBytes(normalized, "instructions", []byte(instructions.Raw))
-				}
-			}
-			normalized, _ = sjson.SetBytes(normalized, "stream", true)
-			return normalized, bytes.Clone(normalized), nil
-		}
-	}
-
-	existingInput := gjson.GetBytes(lastRequest, "input")
-	mergedInput, errMerge := mergeJSONArrayRaw(existingInput.Raw, normalizeJSONArrayRaw(lastResponseOutput))
-	if errMerge != nil {
-		return nil, lastRequest, &interfaces.ErrorMessage{
-			StatusCode: http.StatusBadRequest,
-			Error:      fmt.Errorf("invalid previous response output: %w", errMerge),
-		}
-	}
-
-	mergedInput, errMerge = mergeJSONArrayRaw(mergedInput, nextInput.Raw)
-	if errMerge != nil {
-		return nil, lastRequest, &interfaces.ErrorMessage{
-			StatusCode: http.StatusBadRequest,
-			Error:      fmt.Errorf("invalid request input: %w", errMerge),
-		}
-	}
-
-	normalized, errDelete := sjson.DeleteBytes(rawJSON, "type")
-	if errDelete != nil {
-		normalized = bytes.Clone(rawJSON)
-	}
-	normalized, _ = sjson.DeleteBytes(normalized, "previous_response_id")
-	var errSet error
-	normalized, errSet = sjson.SetRawBytes(normalized, "input", []byte(mergedInput))
-	if errSet != nil {
-		return nil, lastRequest, &interfaces.ErrorMessage{
-			StatusCode: http.StatusBadRequest,
-			Error:      fmt.Errorf("failed to merge websocket input: %w", errSet),
-		}
-	}
-	if !gjson.GetBytes(normalized, "model").Exists() {
-		modelName := strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
-		if modelName != "" {
-			normalized, _ = sjson.SetBytes(normalized, "model", modelName)
-		}
-	}
-	if !gjson.GetBytes(normalized, "instructions").Exists() {
-		instructions := gjson.GetBytes(lastRequest, "instructions")
-		if instructions.Exists() {
-			normalized, _ = sjson.SetRawBytes(normalized, "instructions", []byte(instructions.Raw))
-		}
-	}
-	normalized, _ = sjson.SetBytes(normalized, "stream", true)
-	return normalized, bytes.Clone(normalized), nil
-}
-
-func websocketUpstreamSupportsIncrementalInput(attributes map[string]string, metadata map[string]any) bool {
-	if len(attributes) > 0 {
-		if raw := strings.TrimSpace(attributes["websockets"]); raw != "" {
-			parsed, errParse := strconv.ParseBool(raw)
-			if errParse == nil {
-				return parsed
-			}
-		}
-	}
-	if len(metadata) == 0 {
-		return false
-	}
-	raw, ok := metadata["websockets"]
-	if !ok || raw == nil {
-		return false
-	}
-	switch value := raw.(type) {
-	case bool:
-		return value
-	case string:
-		parsed, errParse := strconv.ParseBool(strings.TrimSpace(value))
-		if errParse == nil {
-			return parsed
-		}
-	default:
-	}
-	return false
-}
-
-func (h *OpenAIResponsesAPIHandler) websocketUpstreamSupportsIncrementalInputForModel(modelName string) bool {
-	if h == nil || h.AuthManager == nil {
-		return false
-	}
-
-	resolvedModelName := modelName
-	initialSuffix := thinking.ParseSuffix(modelName)
-	if initialSuffix.ModelName == "auto" {
-		resolvedBase := util.ResolveAutoModel(initialSuffix.ModelName)
-		if initialSuffix.HasSuffix {
-			resolvedModelName = fmt.Sprintf("%s(%s)", resolvedBase, initialSuffix.RawSuffix)
-		} else {
-			resolvedModelName = resolvedBase
-		}
-	} else {
-		resolvedModelName = util.ResolveAutoModel(modelName)
-	}
-
-	parsed := thinking.ParseSuffix(resolvedModelName)
-	baseModel := strings.TrimSpace(parsed.ModelName)
-	providers := util.GetProviderName(baseModel)
-	if len(providers) == 0 && baseModel != resolvedModelName {
-		providers = util.GetProviderName(resolvedModelName)
-	}
-	if len(providers) == 0 {
-		return false
-	}
-
-	providerSet := make(map[string]struct{}, len(providers))
-	for i := 0; i < len(providers); i++ {
-		providerKey := strings.TrimSpace(strings.ToLower(providers[i]))
-		if providerKey == "" {
-			continue
-		}
-		providerSet[providerKey] = struct{}{}
-	}
-	if len(providerSet) == 0 {
-		return false
-	}
-
-	modelKey := baseModel
-	if modelKey == "" {
-		modelKey = strings.TrimSpace(resolvedModelName)
-	}
-	registryRef := registry.GetGlobalRegistry()
-	now := time.Now()
-	auths := h.AuthManager.List()
-	for i := 0; i < len(auths); i++ {
-		auth := auths[i]
-		if auth == nil {
-			continue
-		}
-		providerKey := strings.TrimSpace(strings.ToLower(auth.Provider))
-		if _, ok := providerSet[providerKey]; !ok {
-			continue
-		}
-		if modelKey != "" && registryRef != nil && !registryRef.ClientSupportsModel(auth.ID, modelKey) {
-			continue
-		}
-		if !responsesWebsocketAuthAvailableForModel(auth, modelKey, now) {
-			continue
-		}
-		if websocketUpstreamSupportsIncrementalInput(auth.Attributes, auth.Metadata) {
-			return true
-		}
-	}
-	return false
-}
-
-func responsesWebsocketAuthAvailableForModel(auth *coreauth.Auth, modelName string, now time.Time) bool {
-	if auth == nil {
-		return false
-	}
-	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
-		return false
-	}
-	if modelName != "" && len(auth.ModelStates) > 0 {
-		state, ok := auth.ModelStates[modelName]
-		if (!ok || state == nil) && modelName != "" {
-			baseModel := strings.TrimSpace(thinking.ParseSuffix(modelName).ModelName)
-			if baseModel != "" && baseModel != modelName {
-				state, ok = auth.ModelStates[baseModel]
-			}
-		}
-		if ok && state != nil {
-			if state.Status == coreauth.StatusDisabled {
-				return false
-			}
-			if state.Unavailable && !state.NextRetryAfter.IsZero() && state.NextRetryAfter.After(now) {
-				return false
-			}
-			return true
-		}
-	}
-	if auth.Unavailable && !auth.NextRetryAfter.IsZero() && auth.NextRetryAfter.After(now) {
-		return false
-	}
-	return true
-}
-
-func shouldHandleResponsesWebsocketPrewarmLocally(rawJSON []byte, lastRequest []byte, allowIncrementalInputWithPreviousResponseID bool) bool {
-	if allowIncrementalInputWithPreviousResponseID || len(lastRequest) != 0 {
-		return false
-	}
-	if strings.TrimSpace(gjson.GetBytes(rawJSON, "type").String()) != wsRequestTypeCreate {
-		return false
-	}
-	generateResult := gjson.GetBytes(rawJSON, "generate")
-	return generateResult.Exists() && !generateResult.Bool()
-}
-
-func writeResponsesWebsocketSyntheticPrewarm(
-	c *gin.Context,
-	conn *websocket.Conn,
-	requestJSON []byte,
-	wsBodyLog *strings.Builder,
-	sessionID string,
-) error {
-	payloads, errPayloads := syntheticResponsesWebsocketPrewarmPayloads(requestJSON)
-	if errPayloads != nil {
-		return errPayloads
-	}
-	for i := 0; i < len(payloads); i++ {
-		markAPIResponseTimestamp(c)
-		appendWebsocketEvent(wsBodyLog, "response", payloads[i])
-		// log.Infof(
-		// 	"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
-		// 	sessionID,
-		// 	websocket.TextMessage,
-		// 	websocketPayloadEventType(payloads[i]),
-		// 	websocketPayloadPreview(payloads[i]),
-		// )
-		if errWrite := conn.WriteMessage(websocket.TextMessage, payloads[i]); errWrite != nil {
-			log.Warnf(
-				"responses websocket: downstream_out write failed id=%s event=%s error=%v",
-				sessionID,
-				websocketPayloadEventType(payloads[i]),
-				errWrite,
-			)
-			return errWrite
-		}
-	}
-	return nil
-}
-
-func syntheticResponsesWebsocketPrewarmPayloads(requestJSON []byte) ([][]byte, error) {
-	responseID := "resp_prewarm_" + uuid.NewString()
-	createdAt := time.Now().Unix()
-	modelName := strings.TrimSpace(gjson.GetBytes(requestJSON, "model").String())
-
-	createdPayload := []byte(`{"type":"response.created","sequence_number":0,"response":{"id":"","object":"response","created_at":0,"status":"in_progress","background":false,"error":null,"output":[]}}`)
-	var errSet error
-	createdPayload, errSet = sjson.SetBytes(createdPayload, "response.id", responseID)
-	if errSet != nil {
-		return nil, errSet
-	}
-	createdPayload, errSet = sjson.SetBytes(createdPayload, "response.created_at", createdAt)
-	if errSet != nil {
-		return nil, errSet
-	}
-	if modelName != "" {
-		createdPayload, errSet = sjson.SetBytes(createdPayload, "response.model", modelName)
-		if errSet != nil {
-			return nil, errSet
-		}
-	}
-
-	completedPayload := []byte(`{"type":"response.completed","sequence_number":1,"response":{"id":"","object":"response","created_at":0,"status":"completed","background":false,"error":null,"output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
-	completedPayload, errSet = sjson.SetBytes(completedPayload, "response.id", responseID)
-	if errSet != nil {
-		return nil, errSet
-	}
-	completedPayload, errSet = sjson.SetBytes(completedPayload, "response.created_at", createdAt)
-	if errSet != nil {
-		return nil, errSet
-	}
-	if modelName != "" {
-		completedPayload, errSet = sjson.SetBytes(completedPayload, "response.model", modelName)
-		if errSet != nil {
-			return nil, errSet
-		}
-	}
-
-	return [][]byte{createdPayload, completedPayload}, nil
-}
-
-func mergeJSONArrayRaw(existingRaw, appendRaw string) (string, error) {
-	existingRaw = strings.TrimSpace(existingRaw)
-	appendRaw = strings.TrimSpace(appendRaw)
-	if existingRaw == "" {
-		existingRaw = "[]"
-	}
-	if appendRaw == "" {
-		appendRaw = "[]"
-	}
-
-	var existing []json.RawMessage
-	if err := json.Unmarshal([]byte(existingRaw), &existing); err != nil {
-		return "", err
-	}
-	var appendItems []json.RawMessage
-	if err := json.Unmarshal([]byte(appendRaw), &appendItems); err != nil {
-		return "", err
-	}
-
-	merged := append(existing, appendItems...)
-	out, err := json.Marshal(merged)
-	if err != nil {
-		return "", err
-	}
-	return string(out), nil
-}
-
-func normalizeJSONArrayRaw(raw []byte) string {
-	trimmed := strings.TrimSpace(string(raw))
-	if trimmed == "" {
-		return "[]"
-	}
-	result := gjson.Parse(trimmed)
-	if result.Type == gjson.JSON && result.IsArray() {
-		return trimmed
-	}
-	return "[]"
-}
-
-func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
-	c *gin.Context,
-	conn *websocket.Conn,
-	cancel handlers.APIHandlerCancelFunc,
-	data <-chan []byte,
-	errs <-chan *interfaces.ErrorMessage,
-	wsBodyLog *strings.Builder,
-	sessionID string,
-) ([]byte, error) {
-	completed := false
-	completedOutput := []byte("[]")
-
-	for {
-		select {
-		case <-c.Request.Context().Done():
-			cancel(c.Request.Context().Err())
-			return completedOutput, c.Request.Context().Err()
-		case errMsg, ok := <-errs:
-			if !ok {
-				errs = nil
-				continue
-			}
-			if errMsg != nil {
-				h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
-				markAPIResponseTimestamp(c)
-				errorPayload, errWrite := writeResponsesWebsocketError(conn, errMsg)
-				appendWebsocketEvent(wsBodyLog, "response", errorPayload)
-				log.Infof(
-					"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
-					sessionID,
-					websocket.TextMessage,
-					websocketPayloadEventType(errorPayload),
-					websocketPayloadPreview(errorPayload),
-				)
-				if errWrite != nil {
-					// log.Warnf(
-					// 	"responses websocket: downstream_out write failed id=%s event=%s error=%v",
-					// 	sessionID,
-					// 	websocketPayloadEventType(errorPayload),
-					// 	errWrite,
-					// )
-					cancel(errMsg.Error)
-					return completedOutput, errWrite
-				}
-			}
-			if errMsg != nil {
-				cancel(errMsg.Error)
-			} else {
-				cancel(nil)
-			}
-			return completedOutput, nil
-		case chunk, ok := <-data:
-			if !ok {
-				if !completed {
-					errMsg := &interfaces.ErrorMessage{
-						StatusCode: http.StatusRequestTimeout,
-						Error:      fmt.Errorf("stream closed before response.completed"),
-					}
-					h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
-					markAPIResponseTimestamp(c)
-					errorPayload, errWrite := writeResponsesWebsocketError(conn, errMsg)
-					appendWebsocketEvent(wsBodyLog, "response", errorPayload)
-					log.Infof(
-						"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
-						sessionID,
-						websocket.TextMessage,
-						websocketPayloadEventType(errorPayload),
-						websocketPayloadPreview(errorPayload),
-					)
-					if errWrite != nil {
-						log.Warnf(
-							"responses websocket: downstream_out write failed id=%s event=%s error=%v",
-							sessionID,
-							websocketPayloadEventType(errorPayload),
-							errWrite,
-						)
-						cancel(errMsg.Error)
-						return completedOutput, errWrite
-					}
-					cancel(errMsg.Error)
-					return completedOutput, nil
-				}
-				cancel(nil)
-				return completedOutput, nil
-			}
-
-			payloads := websocketJSONPayloadsFromChunk(chunk)
-			for i := range payloads {
-				eventType := gjson.GetBytes(payloads[i], "type").String()
-				if eventType == wsEventTypeCompleted {
-					completed = true
-					completedOutput = responseCompletedOutputFromPayload(payloads[i])
-				}
-				markAPIResponseTimestamp(c)
-				appendWebsocketEvent(wsBodyLog, "response", payloads[i])
-				// log.Infof(
-				// 	"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
-				// 	sessionID,
-				// 	websocket.TextMessage,
-				// 	websocketPayloadEventType(payloads[i]),
-				// 	websocketPayloadPreview(payloads[i]),
-				// )
-				if errWrite := conn.WriteMessage(websocket.TextMessage, payloads[i]); errWrite != nil {
-					log.Warnf(
-						"responses websocket: downstream_out write failed id=%s event=%s error=%v",
-						sessionID,
-						websocketPayloadEventType(payloads[i]),
-						errWrite,
-					)
-					cancel(errWrite)
-					return completedOutput, errWrite
-				}
-			}
-		}
-	}
-}
-
-func responseCompletedOutputFromPayload(payload []byte) []byte {
-	output := gjson.GetBytes(payload, "response.output")
-	if output.Exists() && output.IsArray() {
-		return bytes.Clone([]byte(output.Raw))
-	}
-	return []byte("[]")
-}
-
-func websocketJSONPayloadsFromChunk(chunk []byte) [][]byte {
-	payloads := make([][]byte, 0, 2)
-	lines := bytes.Split(chunk, []byte("\n"))
-	for i := range lines {
-		line := bytes.TrimSpace(lines[i])
-		if len(line) == 0 || bytes.HasPrefix(line, []byte("event:")) {
-			continue
-		}
-		if bytes.HasPrefix(line, []byte("data:")) {
-			line = bytes.TrimSpace(line[len("data:"):])
-		}
-		if len(line) == 0 || bytes.Equal(line, []byte(wsDoneMarker)) {
-			continue
-		}
-		if json.Valid(line) {
-			payloads = append(payloads, bytes.Clone(line))
-		}
-	}
-
-	if len(payloads) > 0 {
-		return payloads
-	}
-
-	trimmed := bytes.TrimSpace(chunk)
-	if bytes.HasPrefix(trimmed, []byte("data:")) {
-		trimmed = bytes.TrimSpace(trimmed[len("data:"):])
-	}
-	if len(trimmed) > 0 && !bytes.Equal(trimmed, []byte(wsDoneMarker)) && json.Valid(trimmed) {
-		payloads = append(payloads, bytes.Clone(trimmed))
-	}
-	return payloads
-}
-
-func writeResponsesWebsocketError(conn *websocket.Conn, errMsg *interfaces.ErrorMessage) ([]byte, error) {
-	status := http.StatusInternalServerError
-	errText := http.StatusText(status)
-	if errMsg != nil {
-		if errMsg.StatusCode > 0 {
-			status = errMsg.StatusCode
-			errText = http.StatusText(status)
-		}
-		if errMsg.Error != nil && strings.TrimSpace(errMsg.Error.Error()) != "" {
-			errText = errMsg.Error.Error()
-		}
-	}
-
-	body := handlers.BuildErrorResponseBody(status, errText)
-	payload := []byte(`{}`)
-	var errSet error
-	payload, errSet = sjson.SetBytes(payload, "type", wsEventTypeError)
-	if errSet != nil {
-		return nil, errSet
-	}
-	payload, errSet = sjson.SetBytes(payload, "status", status)
-	if errSet != nil {
-		return nil, errSet
-	}
-
-	if errMsg != nil && errMsg.Addon != nil {
-		headers := []byte(`{}`)
-		hasHeaders := false
-		for key, values := range errMsg.Addon {
-			if len(values) == 0 {
-				continue
-			}
-			headerPath := strings.ReplaceAll(strings.ReplaceAll(key, `\\`, `\\\\`), ".", `\\.`)
-			headers, errSet = sjson.SetBytes(headers, headerPath, values[0])
-			if errSet != nil {
-				return nil, errSet
-			}
-			hasHeaders = true
-		}
-		if hasHeaders {
-			payload, errSet = sjson.SetRawBytes(payload, "headers", headers)
-			if errSet != nil {
-				return nil, errSet
-			}
-		}
-	}
-
-	if len(body) > 0 && json.Valid(body) {
-		errorNode := gjson.GetBytes(body, "error")
-		if errorNode.Exists() {
-			payload, errSet = sjson.SetRawBytes(payload, "error", []byte(errorNode.Raw))
-		} else {
-			payload, errSet = sjson.SetRawBytes(payload, "error", body)
-		}
-		if errSet != nil {
-			return nil, errSet
-		}
-	}
-
-	if !gjson.GetBytes(payload, "error").Exists() {
-		payload, errSet = sjson.SetBytes(payload, "error.type", "server_error")
-		if errSet != nil {
-			return nil, errSet
-		}
-		payload, errSet = sjson.SetBytes(payload, "error.message", errText)
-		if errSet != nil {
-			return nil, errSet
-		}
-	}
-
-	return payload, conn.WriteMessage(websocket.TextMessage, payload)
-}
-
-func appendWebsocketEvent(builder *strings.Builder, eventType string, payload []byte) {
-	if builder == nil {
-		return
-	}
-	if builder.Len() >= wsBodyLogMaxSize {
-		return
-	}
-	trimmedPayload := bytes.TrimSpace(payload)
-	if len(trimmedPayload) == 0 {
-		return
-	}
-	if builder.Len() > 0 {
-		if !appendWebsocketLogString(builder, "\n") {
-			return
-		}
-	}
-	if !appendWebsocketLogString(builder, "websocket.") {
-		return
-	}
-	if !appendWebsocketLogString(builder, eventType) {
-		return
-	}
-	if !appendWebsocketLogString(builder, "\n") {
-		return
-	}
-	if !appendWebsocketLogBytes(builder, trimmedPayload, len(wsBodyLogTruncated)) {
-		appendWebsocketLogString(builder, wsBodyLogTruncated)
-		return
-	}
-	appendWebsocketLogString(builder, "\n")
-}
-
-func appendWebsocketLogString(builder *strings.Builder, value string) bool {
-	if builder == nil {
-		return false
-	}
-	remaining := wsBodyLogMaxSize - builder.Len()
-	if remaining <= 0 {
-		return false
-	}
-	if len(value) <= remaining {
-		builder.WriteString(value)
-		return true
-	}
-	builder.WriteString(value[:remaining])
-	return false
-}
-
-func appendWebsocketLogBytes(builder *strings.Builder, value []byte, reserveForSuffix int) bool {
-	if builder == nil {
-		return false
-	}
-	remaining := wsBodyLogMaxSize - builder.Len()
-	if remaining <= 0 {
-		return false
-	}
-	if len(value) <= remaining {
-		builder.Write(value)
-		return true
-	}
-	limit := remaining - reserveForSuffix
-	if limit < 0 {
-		limit = 0
-	}
-	if limit > len(value) {
-		limit = len(value)
-	}
-	builder.Write(value[:limit])
-	return false
-}
-
-func websocketPayloadEventType(payload []byte) string {
-	eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
-	if eventType == "" {
-		return "-"
-	}
-	return eventType
-}
-
-func websocketPayloadPreview(payload []byte) string {
-	trimmedPayload := bytes.TrimSpace(payload)
-	if len(trimmedPayload) == 0 {
-		return "<empty>"
-	}
-	preview := trimmedPayload
-	if len(preview) > wsPayloadLogMaxSize {
-		preview = preview[:wsPayloadLogMaxSize]
-	}
-	previewText := strings.ReplaceAll(string(preview), "\n", "\\n")
-	previewText = strings.ReplaceAll(previewText, "\r", "\\r")
-	if len(trimmedPayload) > wsPayloadLogMaxSize {
-		return fmt.Sprintf("%s...(truncated,total=%d)", previewText, len(trimmedPayload))
-	}
-	return previewText
-}
-
-func setWebsocketRequestBody(c *gin.Context, body string) {
-	if c == nil {
-		return
-	}
-	trimmedBody := strings.TrimSpace(body)
-	if trimmedBody == "" {
-		return
-	}
-	c.Set(wsRequestBodyKey, []byte(trimmedBody))
-}
-
-func markAPIResponseTimestamp(c *gin.Context) {
-	if c == nil {
-		return
-	}
-	if _, exists := c.Get("API_RESPONSE_TIMESTAMP"); exists {
-		return
-	}
-	c.Set("API_RESPONSE_TIMESTAMP", time.Now())
 }
