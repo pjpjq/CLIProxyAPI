@@ -150,7 +150,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				sess.reqMu.Unlock()
 			}
 			if opts.ExecutionLifecycle != nil || cliproxyexecutor.DownstreamWebsocket(ctx) {
-				return nil, statusErr{code: respHS.StatusCode, msg: string(bodyErr)}
+				return nil, newCodexStatusErr(respHS.StatusCode, bodyErr)
 			}
 			return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
 		}
@@ -158,7 +158,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if sess != nil {
 				sess.reqMu.Unlock()
 			}
-			return nil, statusErr{code: respHS.StatusCode, msg: string(bodyErr)}
+			return nil, newCodexStatusErr(respHS.StatusCode, bodyErr)
 		}
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "dial", errDial)
 		if sess != nil {
@@ -297,6 +297,15 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		var param any
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
+		bootstrap := newCodexStreamBootstrapBuffer()
+		sendChunks := func(chunks []cliproxyexecutor.StreamChunk) bool {
+			for i := range chunks {
+				if !send(chunks[i]) {
+					return false
+				}
+			}
+			return true
+		}
 		for {
 			if ctx != nil && ctx.Err() != nil {
 				terminateReason = "context_done"
@@ -348,6 +357,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if wsErr, ok := parseCodexWebsocketError(payload); ok {
 				terminateReason = "upstream_error"
 				terminateErr = wsErr
+				if !codexErrorIsCredentialAvailabilityNeutral(wsErr) && !sendChunks(bootstrap.Commit()) {
+					terminateReason = "context_done"
+					terminateErr = ctx.Err()
+					return
+				}
 				if sess != nil {
 					e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
 				}
@@ -366,6 +380,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if streamErr, terminalBody, ok := codexTerminalFailureErr(payload); ok {
 				terminateReason = "upstream_error"
 				terminateErr = streamErr
+				if !codexErrorIsCredentialAvailabilityNeutral(streamErr) && !sendChunks(bootstrap.Commit()) {
+					terminateReason = "context_done"
+					terminateErr = ctx.Err()
+					return
+				}
 				if sess != nil {
 					unlockStreamSession()
 					e.invalidateUpstreamConn(sess, conn, "terminal_failure", streamErr)
@@ -384,7 +403,6 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 
 			eventType := gjson.GetBytes(payload, "type").String()
-			isTerminalEvent := eventType == "response.completed" || eventType == "response.done" || eventType == "error"
 			if eventType == "response.output_item.done" {
 				collectCodexOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
 			}
@@ -399,33 +417,33 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 
 			clientPayload := applyCodexIdentityExposeResponsePayload(payload, identityState)
+			var clientChunks []cliproxyexecutor.StreamChunk
 			if cliproxyexecutor.DownstreamWebsocket(ctx) {
 				downstreamPayload := helps.EnsureResponsesUsageDetails(clientPayload)
-				if !send(cliproxyexecutor.StreamChunk{Payload: downstreamPayload}) {
-					terminateReason = "context_done"
-					terminateErr = ctx.Err()
-					return
+				clientChunks = []cliproxyexecutor.StreamChunk{{Payload: downstreamPayload}}
+			} else {
+				payload = normalizeCodexWebsocketCompletion(payload)
+				if eventType == "response.completed" || eventType == "response.done" {
+					payload = completedPayload
 				}
-				if isTerminalEvent {
-					return
+				eventType = gjson.GetBytes(payload, "type").String()
+				clientPayload = applyCodexIdentityExposeResponsePayload(payload, identityState)
+				line := encodeCodexWebsocketAsSSE(clientPayload)
+				chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, clientBody, line, &param, claudeInputTokens)
+				clientChunks = make([]cliproxyexecutor.StreamChunk, 0, len(chunks))
+				for i := range chunks {
+					clientChunks = append(clientChunks, cliproxyexecutor.StreamChunk{Payload: chunks[i]})
 				}
-				continue
 			}
-
-			payload = normalizeCodexWebsocketCompletion(payload)
-			if eventType == "response.completed" || eventType == "response.done" {
-				payload = completedPayload
+			if bootstrap.Active() && codexStreamBootstrapEvent(eventType) {
+				clientChunks = bootstrap.Buffer(len(payload), clientChunks...)
+			} else if bootstrap.Active() {
+				clientChunks = bootstrap.Commit(clientChunks...)
 			}
-			eventType = gjson.GetBytes(payload, "type").String()
-			clientPayload = applyCodexIdentityExposeResponsePayload(payload, identityState)
-			line := encodeCodexWebsocketAsSSE(clientPayload)
-			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, clientBody, line, &param, claudeInputTokens)
-			for i := range chunks {
-				if !send(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
-					terminateReason = "context_done"
-					terminateErr = ctx.Err()
-					return
-				}
+			if !sendChunks(clientChunks) {
+				terminateReason = "context_done"
+				terminateErr = ctx.Err()
+				return
 			}
 			if eventType == "response.completed" || eventType == "response.done" {
 				return

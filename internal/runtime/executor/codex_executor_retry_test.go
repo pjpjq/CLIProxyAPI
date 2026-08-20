@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -69,8 +70,33 @@ func TestNewCodexStatusErrTreatsCapacityAsRetryableRateLimit(t *testing.T) {
 	if got := err.StatusCode(); got != http.StatusTooManyRequests {
 		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
 	}
+	if err.RetryAfter() == nil || *err.RetryAfter() != codexModelCapacityRetryAfter {
+		t.Fatalf("retryAfter = %v, want %v", err.RetryAfter(), codexModelCapacityRetryAfter)
+	}
+	if !err.IsCredentialAvailabilityNeutral() {
+		t.Fatal("capacity error must not cool the selected credential")
+	}
+	if strings.Contains(err.Error(), "server_is_overloaded") || !strings.Contains(err.Error(), `"code":"server_error"`) {
+		t.Fatalf("capacity error was not sanitized for client retry: %v", err)
+	}
+}
+
+func TestNewCodexStatusErrTreatsServerOverloadedCodeAsCapacity(t *testing.T) {
+	err := newCodexStatusErr(http.StatusBadRequest, []byte(`{"error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"server overloaded"}}`))
+
+	if err.StatusCode() != http.StatusTooManyRequests || err.RetryAfter() == nil || !err.IsCredentialAvailabilityNeutral() {
+		t.Fatalf("server overload classification = status %d retry %v neutral %t", err.StatusCode(), err.RetryAfter(), err.IsCredentialAvailabilityNeutral())
+	}
+}
+
+func TestNewCodexStatusErrDoesNotTreatGenericSlowDownAsCapacity(t *testing.T) {
+	err := newCodexStatusErr(http.StatusTooManyRequests, []byte(`{"error":{"type":"rate_limit_error","code":"slow_down","message":"Reduce request rate."}}`))
+
+	if err.IsCredentialAvailabilityNeutral() {
+		t.Fatalf("generic slow_down must not bypass credential cooldown: %#v", err)
+	}
 	if err.RetryAfter() != nil {
-		t.Fatalf("expected nil explicit retryAfter for capacity fallback, got %v", *err.RetryAfter())
+		t.Fatalf("generic slow_down retryAfter = %v, want upstream/default behavior", *err.RetryAfter())
 	}
 }
 

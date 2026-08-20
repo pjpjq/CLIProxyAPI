@@ -14,6 +14,8 @@ import (
 
 const codexIncompleteStreamMessage = "stream error: stream disconnected before completion: stream closed before response.completed"
 
+const codexModelCapacityRetryAfter = time.Second
+
 type codexIncompleteStreamError struct {
 	statusErr
 }
@@ -186,7 +188,7 @@ func codexTerminalFailureBody(eventData []byte) ([]byte, bool) {
 		if len(body) == 0 {
 			body = codexTerminalTopLevelErrorBody(eventData)
 		}
-	case "response.failed":
+	case "response.failed", "response.error":
 		body = codexTerminalErrorBody(eventData, "response.error")
 		if len(body) == 0 {
 			body = codexTerminalErrorBody(eventData, "error")
@@ -284,11 +286,20 @@ func codexTerminalErrorIsContextLength(body []byte) bool {
 
 func newCodexStatusErr(statusCode int, body []byte) statusErr {
 	errCode := statusCode
-	if isCodexModelCapacityError(body) || isCodexUsageLimitError(body) {
+	isCapacityError := isCodexModelCapacityError(body)
+	if isCapacityError || isCodexUsageLimitError(body) {
 		errCode = http.StatusTooManyRequests
 	}
+	if isCapacityError {
+		body = sanitizeCodexModelCapacityError(body)
+	}
 	body = classifyCodexStatusError(errCode, body)
-	err := statusErr{code: errCode, msg: string(body)}
+	err := statusErr{code: errCode, msg: string(body), availabilityNeutral: isCapacityError}
+	if isCapacityError {
+		retryAfter := codexModelCapacityRetryAfter
+		err.retryAfter = &retryAfter
+		return err
+	}
 	if retryAfter := parseCodexRetryAfter(errCode, body, time.Now()); retryAfter != nil {
 		err.retryAfter = retryAfter
 	}
@@ -350,6 +361,12 @@ func isCodexModelCapacityError(errorBody []byte) bool {
 		gjson.GetBytes(errorBody, "message").String(),
 		string(errorBody),
 	}
+	for _, path := range []string{"error.code", "code", "response.error.code"} {
+		switch strings.ToLower(strings.TrimSpace(gjson.GetBytes(errorBody, path).String())) {
+		case "server_is_overloaded", "server_overloaded":
+			return true
+		}
+	}
 	for _, candidate := range candidates {
 		lower := strings.ToLower(strings.TrimSpace(candidate))
 		if lower == "" {
@@ -361,6 +378,21 @@ func isCodexModelCapacityError(errorBody []byte) bool {
 		}
 	}
 	return false
+}
+
+func sanitizeCodexModelCapacityError(errorBody []byte) []byte {
+	message := strings.TrimSpace(gjson.GetBytes(errorBody, "error.message").String())
+	if message == "" {
+		message = strings.TrimSpace(gjson.GetBytes(errorBody, "message").String())
+	}
+	if message == "" {
+		message = "Selected model is at capacity. Please try a different model."
+	}
+	out := []byte(`{"error":{}}`)
+	out, _ = sjson.SetBytes(out, "error.type", "server_error")
+	out, _ = sjson.SetBytes(out, "error.code", "server_error")
+	out, _ = sjson.SetBytes(out, "error.message", message)
+	return out
 }
 
 // isCodexUsageLimitError reports whether the error body represents a Codex

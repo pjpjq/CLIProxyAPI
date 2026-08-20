@@ -621,6 +621,137 @@ func TestCodexTerminalStreamErrHandlesUsageLimitResponseFailed(t *testing.T) {
 	}
 }
 
+func TestCodexTerminalStreamErrHandlesCapacityResponseError(t *testing.T) {
+	streamErr, _, ok := codexTerminalStreamErr([]byte(`{"type":"response.error","response":{"error":{"code":"server_is_overloaded","message":"Selected model is at capacity. Please try a different model."}}}`))
+	if !ok {
+		t.Fatal("expected response.error capacity terminal error to be handled")
+	}
+	if got := statusCodeFromTestError(t, streamErr); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusTooManyRequests, streamErr)
+	}
+	if !streamErr.IsCredentialAvailabilityNeutral() {
+		t.Fatalf("response.error capacity must be availability neutral: %v", streamErr)
+	}
+}
+
+func TestCodexExecutorExecuteStream_BuffersLifecycleBeforeCapacity(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.created","response":{"id":"resp_1"}}`+"\n\n")
+		_, _ = io.WriteString(w, "event: response.in_progress\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.in_progress","response":{"id":"resp_1"}}`+"\n\n")
+		_, _ = io.WriteString(w, "event: error\n")
+		_, _ = io.WriteString(w, `data: {"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Selected model is at capacity. Please try a different model."}}`+"\n\n")
+	}))
+	defer server.Close()
+
+	result := newCodexCapacityTestStream(t, server.URL)
+	chunk, ok := <-result.Chunks
+	if !ok || chunk.Err == nil {
+		t.Fatalf("first chunk = %#v, want capacity error", chunk)
+	}
+	if len(chunk.Payload) != 0 {
+		t.Fatalf("bootstrap payload escaped before capacity failover: %q", chunk.Payload)
+	}
+	if statusCodeFromTestError(t, chunk.Err) != http.StatusTooManyRequests {
+		t.Fatalf("capacity status = %d, want 429", statusCodeFromTestError(t, chunk.Err))
+	}
+}
+
+func TestCodexExecutorExecuteStream_BuffersLifecycleBeforeCapacityResponseError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.created","response":{"id":"resp_1"}}`+"\n\n")
+		_, _ = io.WriteString(w, "event: response.error\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.error","response":{"error":{"code":"server_is_overloaded","message":"Selected model is at capacity. Please try a different model."}}}`+"\n\n")
+	}))
+	defer server.Close()
+
+	result := newCodexCapacityTestStream(t, server.URL)
+	chunk, ok := <-result.Chunks
+	if !ok || chunk.Err == nil {
+		t.Fatalf("first chunk = %#v, want capacity error", chunk)
+	}
+	if len(chunk.Payload) != 0 {
+		t.Fatalf("bootstrap payload escaped before response.error capacity failover: %q", chunk.Payload)
+	}
+	if statusCodeFromTestError(t, chunk.Err) != http.StatusTooManyRequests {
+		t.Fatalf("capacity status = %d, want 429", statusCodeFromTestError(t, chunk.Err))
+	}
+}
+
+func TestCodexExecutorExecuteStream_CommitsAfterSemanticOutput(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.created","response":{"id":"resp_1"}}`+"\n\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.output_text.delta","delta":"ok"}`+"\n\n")
+		_, _ = io.WriteString(w, "event: response.failed\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.failed","response":{"error":{"code":"server_is_overloaded","message":"Selected model is at capacity. Please try a different model."}}}`+"\n\n")
+	}))
+	defer server.Close()
+
+	result := newCodexCapacityTestStream(t, server.URL)
+	var payload []byte
+	var terminal error
+	for chunk := range result.Chunks {
+		payload = append(payload, chunk.Payload...)
+		if chunk.Err != nil {
+			terminal = chunk.Err
+		}
+	}
+	if !bytes.Contains(payload, []byte(`"delta":"ok"`)) {
+		t.Fatalf("semantic output was not committed: %q", payload)
+	}
+	if terminal == nil || strings.Contains(terminal.Error(), "server_is_overloaded") {
+		t.Fatalf("terminal capacity error = %v, want sanitized retryable error", terminal)
+	}
+}
+
+func TestCodexExecutorExecute_TreatsCapacityFailureAsRetryable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.created","response":{"id":"resp_1"}}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.failed","response":{"error":{"code":"server_is_overloaded","message":"Selected model is at capacity. Please try a different model."}}}`+"\n\n")
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	_, errExecute := executor.Execute(context.Background(), &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}, cliproxyexecutor.Request{
+		Model:   "gpt-5.6-terra",
+		Payload: []byte(`{"model":"gpt-5.6-terra","input":"ok"}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")})
+	if errExecute == nil || statusCodeFromTestError(t, errExecute) != http.StatusTooManyRequests {
+		t.Fatalf("Execute() error = %v, want 429 capacity failure", errExecute)
+	}
+	retryable, ok := errExecute.(interface{ RetryAfter() *time.Duration })
+	if !ok || retryable.RetryAfter() == nil || *retryable.RetryAfter() != codexModelCapacityRetryAfter {
+		t.Fatalf("Execute() retry = %#v, want %v", errExecute, codexModelCapacityRetryAfter)
+	}
+}
+
+func newCodexCapacityTestStream(t *testing.T, baseURL string) *cliproxyexecutor.StreamResult {
+	t.Helper()
+	executor := NewCodexExecutor(&config.Config{})
+	result, err := executor.ExecuteStream(context.Background(), &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": baseURL,
+		"api_key":  "test",
+	}}, cliproxyexecutor.Request{
+		Model:   "gpt-5.6-terra",
+		Payload: []byte(`{"model":"gpt-5.6-terra","input":"ok"}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response"), Stream: true})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	return result
+}
+
 func statusCodeFromTestError(t *testing.T, err error) int {
 	t.Helper()
 

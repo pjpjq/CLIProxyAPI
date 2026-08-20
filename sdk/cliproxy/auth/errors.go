@@ -15,6 +15,10 @@ const connectionLifecycleErrorCode = ErrorCodeConnectionLifecycle
 // ErrorCodeForceCooldown marks failures that must enforce credential cooldown.
 const ErrorCodeForceCooldown = "force_cooldown"
 
+// ErrorCodeCredentialAvailabilityNeutral marks transient upstream availability
+// failures that should rotate credentials without cooling the selected account.
+const ErrorCodeCredentialAvailabilityNeutral = "credential_availability_neutral"
+
 // Error describes an authentication related failure in a provider agnostic format.
 type Error struct {
 	// Code is a short machine readable identifier.

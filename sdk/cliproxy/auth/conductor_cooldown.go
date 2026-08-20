@@ -1305,6 +1305,8 @@ func resultErrorFromError(err error) *Error {
 		resultErr.HTTPStatus = statusCodeFromError(err)
 	}
 	switch {
+	case isCredentialAvailabilityNeutralError(err):
+		resultErr.Code = ErrorCodeCredentialAvailabilityNeutral
 	case isRequestScopedError(err) || isRequestInvalidError(err):
 		// Prefer true request-scoped faults (including Claude OAuth cancellation)
 		// over the broader connection-lifecycle classification.
@@ -1326,7 +1328,22 @@ func shouldSkipCredentialCooldown(err *Error) bool {
 	if err != nil && err.Code == ErrorCodeForceCooldown {
 		return false
 	}
-	return isRequestScopedResultError(err) || isConnectionLifecycleResultError(err)
+	return isCredentialAvailabilityNeutralResultError(err) || isRequestScopedResultError(err) || isConnectionLifecycleResultError(err)
+}
+
+func isCredentialAvailabilityNeutralError(err error) bool {
+	if err == nil {
+		return false
+	}
+	type availabilityNeutralProvider interface {
+		IsCredentialAvailabilityNeutral() bool
+	}
+	var provider availabilityNeutralProvider
+	return errors.As(err, &provider) && provider != nil && provider.IsCredentialAvailabilityNeutral()
+}
+
+func isCredentialAvailabilityNeutralResultError(err *Error) bool {
+	return err != nil && err.Code == ErrorCodeCredentialAvailabilityNeutral
 }
 
 // isConnectionLifecycleError reports transport/session lifecycle failures that must

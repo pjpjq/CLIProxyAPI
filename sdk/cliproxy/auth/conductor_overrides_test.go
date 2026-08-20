@@ -286,6 +286,20 @@ type requestScopedStatusError struct {
 	message string
 }
 
+type availabilityNeutralStatusError struct {
+	status     int
+	message    string
+	retryAfter time.Duration
+}
+
+func (e *availabilityNeutralStatusError) Error() string   { return e.message }
+func (e *availabilityNeutralStatusError) StatusCode() int { return e.status }
+func (e *availabilityNeutralStatusError) RetryAfter() *time.Duration {
+	value := e.retryAfter
+	return &value
+}
+func (e *availabilityNeutralStatusError) IsCredentialAvailabilityNeutral() bool { return true }
+
 func (e *requestScopedStatusError) Error() string {
 	if e == nil {
 		return ""
@@ -2005,6 +2019,47 @@ func TestManager_RecordResult_AvailabilityNeutralSkipsSchedulerUpdate(t *testing
 	m.scheduler.mu.Unlock()
 	if after != before {
 		t.Fatal("availability-neutral result unexpectedly replaced scheduler auth snapshot")
+	}
+}
+
+func TestManager_CapacityRotatesWithoutCoolingCredential(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	executor := &authFallbackExecutor{
+		id: "codex",
+		executeErrors: map[string]error{
+			"capacity-auth-a": &availabilityNeutralStatusError{
+				status: http.StatusTooManyRequests, message: "capacity", retryAfter: time.Second,
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "gpt-5.6-terra-capacity-test"
+	for _, authID := range []string{"capacity-auth-a", "capacity-auth-b"} {
+		registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+		if _, errRegister := m.Register(context.Background(), &Auth{ID: authID, Provider: "codex"}); errRegister != nil {
+			t.Fatalf("register %s: %v", authID, errRegister)
+		}
+	}
+
+	response, errExecute := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if string(response.Payload) != "capacity-auth-b" {
+		t.Fatalf("response auth = %q, want fallback credential", response.Payload)
+	}
+	if got := executor.ExecuteCalls(); !slices.Equal(got, []string{"capacity-auth-a", "capacity-auth-b"}) {
+		t.Fatalf("execute calls = %v", got)
+	}
+
+	first, _ := m.GetByID("capacity-auth-a")
+	if first.Unavailable || !first.NextRetryAfter.IsZero() || first.Quota.Exceeded {
+		t.Fatalf("capacity credential was cooled: unavailable=%t retry=%v quota=%#v", first.Unavailable, first.NextRetryAfter, first.Quota)
+	}
+	if state := first.ModelStates[model]; state != nil && (state.Unavailable || state.Quota.Exceeded || !state.NextRetryAfter.IsZero()) {
+		t.Fatalf("capacity model was cooled: %#v", state)
 	}
 }
 

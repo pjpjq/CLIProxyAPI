@@ -144,18 +144,34 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		var param any
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
+		bootstrap := newCodexStreamBootstrapBuffer()
+		emit := func(chunks []cliproxyexecutor.StreamChunk) bool {
+			for i := range chunks {
+				select {
+				case out <- chunks[i]:
+				case <-ctx.Done():
+					return false
+				}
+			}
+			return true
+		}
 		for scanner.Scan() {
 			line := applyCodexIdentityConfuseResponsePayload(scanner.Bytes(), identityState)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			translatedLine := bytes.Clone(line)
 			terminalSuccess := false
+			eventType := ""
+			bufferBootstrapLine := false
 
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
 				data = helps.RestoreCodexMultiAgentV2Response(data, optimizeMultiAgentV2)
 				translatedLine = append([]byte("data: "), data...)
-				eventType := gjson.GetBytes(data, "type").String()
+				eventType = gjson.GetBytes(data, "type").String()
 				if streamErr, terminalBody, ok := codexTerminalFailureErr(data); ok {
+					if !codexErrorIsCredentialAvailabilityNeutral(streamErr) && !emit(bootstrap.Commit()) {
+						return
+					}
 					if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
 						helps.RecordAPIResponseError(ctx, e.cfg, errClearReplay)
 						reporter.PublishFailure(ctx, errClearReplay)
@@ -174,6 +190,8 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					return
 				}
 				switch eventType {
+				case "response.created", "response.in_progress", "response.queued":
+					bufferBootstrapLine = bootstrap.Active()
 				case "response.output_item.done":
 					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
 				case "response.completed", "response.incomplete":
@@ -188,16 +206,31 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					}
 					translatedLine = append([]byte("data: "), data...)
 				}
+			} else if bytes.HasPrefix(line, []byte("event:")) {
+				eventType = strings.TrimSpace(string(line[len("event:"):]))
+				bufferBootstrapLine = bootstrap.Active() && (codexStreamBootstrapEvent(eventType) || codexStreamTerminalEvent(eventType))
+			} else if bootstrap.Active() {
+				trimmed := bytes.TrimSpace(line)
+				bufferBootstrapLine = len(trimmed) == 0 || bytes.HasPrefix(trimmed, []byte(":")) || bytes.HasPrefix(trimmed, []byte("id:")) || bytes.HasPrefix(trimmed, []byte("retry:"))
 			}
 
 			translatedLine = applyCodexIdentityExposeResponsePayload(translatedLine, identityState)
 			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, body, translatedLine, &param, claudeInputTokens)
+			translatedChunks := make([]cliproxyexecutor.StreamChunk, 0, len(chunks))
 			for i := range chunks {
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
-				case <-ctx.Done():
+				translatedChunks = append(translatedChunks, cliproxyexecutor.StreamChunk{Payload: chunks[i]})
+			}
+			if bufferBootstrapLine {
+				if !emit(bootstrap.Buffer(len(line), translatedChunks...)) {
 					return
 				}
+				continue
+			}
+			if bootstrap.Active() {
+				translatedChunks = bootstrap.Commit(translatedChunks...)
+			}
+			if !emit(translatedChunks) {
+				return
 			}
 			if terminalSuccess {
 				return

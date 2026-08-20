@@ -682,6 +682,56 @@ func TestCodexWebsocketsExecuteStreamPropagatesUpstreamErrorForDownstreamWebsock
 	}
 }
 
+func TestCodexWebsocketsExecuteStreamBuffersLifecycleBeforeCapacity(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Errorf("upgrade websocket: %v", errUpgrade)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			t.Errorf("read upstream websocket message: %v", errRead)
+			return
+		}
+		for _, payload := range [][]byte{
+			[]byte(`{"type":"response.created","response":{"id":"resp_1"}}`),
+			[]byte(`{"type":"response.in_progress","response":{"id":"resp_1"}}`),
+			[]byte(`{"type":"response.failed","response":{"error":{"code":"server_is_overloaded","message":"Selected model is at capacity. Please try a different model."}}}`),
+		} {
+			if errWrite := conn.WriteMessage(websocket.TextMessage, payload); errWrite != nil {
+				t.Errorf("write websocket message: %v", errWrite)
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	result, errExecute := exec.ExecuteStream(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), &cliproxyauth.Auth{
+		Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL},
+	}, cliproxyexecutor.Request{
+		Model:   "gpt-5.6-terra",
+		Payload: []byte(`{"model":"gpt-5.6-terra","input":"hello"}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response"), ResponseFormat: sdktranslator.FromString("openai-response")})
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream() error = %v", errExecute)
+	}
+	select {
+	case chunk, ok := <-result.Chunks:
+		if !ok || chunk.Err == nil || len(chunk.Payload) != 0 {
+			t.Fatalf("first chunk = %#v, want capacity error without lifecycle payload", chunk)
+		}
+		status, okStatus := chunk.Err.(interface{ StatusCode() int })
+		if !okStatus || status.StatusCode() != http.StatusTooManyRequests {
+			t.Fatalf("capacity status = %#v, want 429", chunk.Err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for capacity stream error")
+	}
+}
+
 func TestSendTerminalWebsocketReadInvalidatesBeforeWaitingForCapacity(t *testing.T) {
 	terminalErr := &websocket.CloseError{Code: websocket.CloseMessageTooBig}
 
@@ -1547,6 +1597,28 @@ func TestParseCodexWebsocketErrorUsesUsageLimitRetryMetadata(t *testing.T) {
 	}
 	if got := *retryable.RetryAfter(); got != 7*time.Second {
 		t.Fatalf("retryAfter = %v, want 7s", got)
+	}
+}
+
+func TestParseCodexWebsocketErrorTreatsCapacityAsAvailabilityNeutral(t *testing.T) {
+	err, ok := parseCodexWebsocketError([]byte(`{"type":"error","status":400,"body":{"error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Selected model is at capacity. Please try a different model."}}}`))
+	if !ok {
+		t.Fatal("expected websocket capacity error")
+	}
+	status, ok := err.(interface{ StatusCode() int })
+	if !ok || status.StatusCode() != http.StatusTooManyRequests {
+		t.Fatalf("status = %#v, want 429", err)
+	}
+	retryable, ok := err.(interface{ RetryAfter() *time.Duration })
+	if !ok || retryable.RetryAfter() == nil || *retryable.RetryAfter() != codexModelCapacityRetryAfter {
+		t.Fatalf("retryAfter = %#v, want %v", err, codexModelCapacityRetryAfter)
+	}
+	neutral, ok := err.(interface{ IsCredentialAvailabilityNeutral() bool })
+	if !ok || !neutral.IsCredentialAvailabilityNeutral() {
+		t.Fatalf("capacity websocket error must be availability neutral: %#v", err)
+	}
+	if strings.Contains(err.Error(), "server_is_overloaded") {
+		t.Fatalf("fatal Codex capacity code leaked downstream: %v", err)
 	}
 }
 
