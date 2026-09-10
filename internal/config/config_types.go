@@ -503,6 +503,10 @@ type CodexKey struct {
 	// Websockets enables the Responses API websocket transport for this credential.
 	Websockets bool `yaml:"websockets,omitempty" json:"websockets,omitempty"`
 
+	// ResponsesPassThrough forwards OpenAI Responses requests without translating
+	// or rebuilding the request/response payload. It is disabled by default.
+	ResponsesPassThrough bool `yaml:"responses-pass-through,omitempty" json:"responses-pass-through,omitempty"`
+
 	// AlphaSearch allows this Codex API key to serve the Alpha Search endpoint.
 	AlphaSearch bool `yaml:"alpha-search,omitempty" json:"alpha-search,omitempty"`
 

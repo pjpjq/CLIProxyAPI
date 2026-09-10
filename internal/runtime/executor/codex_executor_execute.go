@@ -22,6 +22,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if opts.Alt == "responses/compact" {
 		return e.executeCompact(ctx, auth, req, opts)
 	}
+	if e.responsesPassThroughEnabled(auth, opts) {
+		return e.executeResponsesPassThrough(ctx, auth, req, opts)
+	}
 	if isCodexOpenAIImageRequest(opts) {
 		return e.executeOpenAIImage(ctx, auth, req, opts)
 	}
