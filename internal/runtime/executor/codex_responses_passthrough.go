@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -52,7 +53,12 @@ func responsesPassThroughModel(body []byte, model string) []byte {
 	return body
 }
 
-func (e *CodexExecutor) executeResponsesPassThrough(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+func (e *CodexExecutor) executeResponsesPassThrough(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
+	reporter.SetStream(false)
+	defer reporter.TrackFailure(ctx, &err)
+
 	body := responsesPassThroughBody(req)
 	if len(body) == 0 {
 		return cliproxyexecutor.Response{}, statusErr{code: http.StatusBadRequest, msg: "empty Responses request body"}
@@ -76,7 +82,8 @@ func (e *CodexExecutor) executeResponsesPassThrough(ctx context.Context, auth *c
 	applyCodexHeaders(httpReq, auth, codexCredsKey(auth), false, e.cfg, opts.Headers)
 	httpReq.Header.Set("Accept", "application/json")
 	client := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
-	httpResp, err := client.Do(httpReq)
+	httpClient := reporter.TrackHTTPClient(client)
+	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
@@ -88,10 +95,22 @@ func (e *CodexExecutor) executeResponsesPassThrough(ctx context.Context, auth *c
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		return cliproxyexecutor.Response{}, newCodexStatusErr(httpResp.StatusCode, data)
 	}
+	if detail, ok := helps.ParseCodexUsage(data); ok {
+		reporter.Publish(ctx, detail)
+	} else if detail := helps.ParseOpenAIUsage(data); detail.TotalTokens > 0 {
+		reporter.Publish(ctx, detail)
+	} else {
+		reporter.EnsurePublished(ctx)
+	}
 	return cliproxyexecutor.Response{Payload: data, Headers: httpResp.Header.Clone()}, nil
 }
 
-func (e *CodexExecutor) executeResponsesPassThroughStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+func (e *CodexExecutor) executeResponsesPassThroughStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
+	reporter.SetStream(true)
+	defer reporter.TrackFailure(ctx, &err)
+
 	body := responsesPassThroughBody(req)
 	if len(body) == 0 {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "empty Responses request body"}
@@ -113,7 +132,8 @@ func (e *CodexExecutor) executeResponsesPassThroughStream(ctx context.Context, a
 	applyCodexHeaders(httpReq, auth, codexCredsKey(auth), true, e.cfg, opts.Headers)
 	httpReq.Header.Set("Accept", "text/event-stream")
 	client := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
-	httpResp, err := client.Do(httpReq)
+	httpClient := reporter.TrackHTTPClientRoundTripOnly(client)
+	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +146,9 @@ func (e *CodexExecutor) executeResponsesPassThroughStream(ctx context.Context, a
 	go func() {
 		defer close(out)
 		defer httpResp.Body.Close()
+		defer reporter.EnsurePublished(ctx)
 		r := bufio.NewReader(httpResp.Body)
+		var published bool
 		for {
 			chunk, readErr := r.ReadBytes('\n')
 			if len(chunk) > 0 {
@@ -135,9 +157,23 @@ func (e *CodexExecutor) executeResponsesPassThroughStream(ctx context.Context, a
 				case <-ctx.Done():
 					return
 				}
+				if !published && (bytes.Contains(chunk, []byte("response.completed")) || bytes.Contains(chunk, []byte("response.done")) || bytes.Contains(chunk, []byte("response.incomplete"))) {
+					line := bytes.TrimSpace(chunk)
+					if bytes.HasPrefix(line, []byte("data:")) {
+						data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+						if detail, ok := helps.ParseCodexUsage(data); ok {
+							reporter.Publish(ctx, detail)
+							published = true
+						} else if detail := helps.ParseOpenAIUsage(data); detail.TotalTokens > 0 {
+							reporter.Publish(ctx, detail)
+							published = true
+						}
+					}
+				}
 			}
 			if readErr != nil {
 				if readErr != io.EOF {
+					reporter.PublishFailure(ctx, readErr)
 					select {
 					case out <- cliproxyexecutor.StreamChunk{Err: readErr}:
 					case <-ctx.Done():
