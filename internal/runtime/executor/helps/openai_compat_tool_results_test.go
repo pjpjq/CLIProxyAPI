@@ -13,10 +13,14 @@ func TestNormalizeOpenAIToolResultsTextOnly(t *testing.T) {
         {"role":"tool","tool_call_id":"call_1","content":[
             {"type":"text","text":"image inspected"},
             {"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}
-        ]},
-        {"role":"tool","tool_call_id":"call_2","content":"already text"},
-        {"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/user.png"}}]}
-    ]}`)
+		]},
+		{"role":"tool","tool_call_id":"call_2","content":"already text"},
+		{"role":"user","content":[
+			{"type":"text","text":"Images returned by the preceding tool call(s):"},
+			{"type":"image_url","image_url":{"url":"https://example.com/tool.png"}}
+		]},
+		{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/user.png"}}]}
+	]}`)
 
 	got := NormalizeOpenAIToolResultsTextOnly(input)
 
@@ -33,7 +37,11 @@ func TestNormalizeOpenAIToolResultsTextOnly(t *testing.T) {
 	if !gjson.GetBytes(got, "messages.0.content").IsArray() {
 		t.Fatal("assistant content array was unexpectedly changed")
 	}
-	if !gjson.GetBytes(got, "messages.3.content").IsArray() {
+	wantRelay := openAIToolResultImageRelayNotice + "\n\n" + openAIToolResultImageOmittedText
+	if relay := gjson.GetBytes(got, "messages.3.content"); relay.Type != gjson.String || relay.String() != wantRelay {
+		t.Fatalf("tool image relay content = %q, want %q", relay.String(), wantRelay)
+	}
+	if !gjson.GetBytes(got, "messages.4.content").IsArray() {
 		t.Fatal("non-tool content array was unexpectedly changed")
 	}
 }
