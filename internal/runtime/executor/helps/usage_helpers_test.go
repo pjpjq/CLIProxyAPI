@@ -47,6 +47,23 @@ func TestParseOpenAIUsageChatCompletions(t *testing.T) {
 	}
 }
 
+func TestParseOpenAIUsageWrappedDataUsage(t *testing.T) {
+	data := []byte(`{"data":{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"123"}}],"usage":{"prompt_tokens":15,"completion_tokens":130,"total_tokens":145,"completion_tokens_details":{"reasoning_tokens":125}}},"success":true}`)
+	detail := ParseOpenAIUsage(data)
+	if detail.InputTokens != 15 {
+		t.Fatalf("input tokens = %d, want %d", detail.InputTokens, 15)
+	}
+	if detail.OutputTokens != 130 {
+		t.Fatalf("output tokens = %d, want %d", detail.OutputTokens, 130)
+	}
+	if detail.TotalTokens != 145 {
+		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 145)
+	}
+	if detail.ReasoningTokens != 125 {
+		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 125)
+	}
+}
+
 func TestParseOpenAIUsageResponses(t *testing.T) {
 	data := []byte(`{"service_tier":"default","usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":7},"output_tokens_details":{"reasoning_tokens":9}}}`)
 	detail := ParseOpenAIUsage(data)
@@ -198,6 +215,30 @@ func TestParseOpenAIStreamUsageResponsesFields(t *testing.T) {
 	}
 	if detail.ResponseServiceTier != "flex" {
 		t.Fatalf("response service tier = %q, want flex", detail.ResponseServiceTier)
+	}
+}
+
+func TestParseOpenAIStreamUsageResponseCompletedFields(t *testing.T) {
+	line := []byte(`data: {"type":"response.completed","response":{"service_tier":"priority","usage":{"input_tokens":8,"output_tokens":5,"total_tokens":13,"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":2}}}}`)
+	detail, ok := ParseOpenAIStreamUsage(line)
+	if !ok {
+		t.Fatal("ParseOpenAIStreamUsage() ok = false, want true")
+	}
+	if detail.InputTokens != 8 || detail.OutputTokens != 5 || detail.TotalTokens != 13 {
+		t.Fatalf("detail = %+v, want input=8 output=5 total=13", detail)
+	}
+	if detail.CachedTokens != 3 || detail.ReasoningTokens != 2 {
+		t.Fatalf("detail = %+v, want cached=3 reasoning=2", detail)
+	}
+	if detail.ResponseServiceTier != "priority" {
+		t.Fatalf("response service tier = %q, want priority", detail.ResponseServiceTier)
+	}
+
+	var buffer StreamUsageBuffer
+	buffer.ObserveOpenAIStream(line)
+	buffered, bufferedOK := buffer.Detail()
+	if !bufferedOK || buffered != detail {
+		t.Fatalf("StreamUsageBuffer.Detail() = (%+v, %v), want (%+v, true)", buffered, bufferedOK, detail)
 	}
 }
 
