@@ -71,6 +71,59 @@ func TestOpenAICompatResponsesWireHandlerEndToEnd(t *testing.T) {
 		}
 	})
 
+	t.Run("responses preserves previous response tool continuation", func(t *testing.T) {
+		server, model, requests := newOpenAICompatWireTestServer(t, "responses", false)
+		firstPayload := fmt.Sprintf(`{
+			"model":%q,
+			"input":[{"role":"user","content":[{"type":"input_text","text":"Call add in turn one."}]}],
+			"tools":[{"type":"function","name":"add","parameters":{"type":"object","properties":{}}}],
+			"store":true
+		}`, model)
+
+		firstRecorder := performOpenAICompatWireRequest(t, server, "/v1/responses", firstPayload)
+		firstCaptured := <-requests
+		if firstCaptured.path != "/v1/responses" {
+			t.Fatalf("turn 1 upstream path = %q, want /v1/responses", firstCaptured.path)
+		}
+		if gjson.GetBytes(firstCaptured.body, "previous_response_id").Exists() {
+			t.Fatalf("turn 1 unexpectedly gained previous_response_id: %s", firstCaptured.body)
+		}
+		responseID := gjson.GetBytes(firstRecorder.Body.Bytes(), "id").String()
+		if responseID != "resp_turn_1" {
+			t.Fatalf("turn 1 response id = %q, want resp_turn_1; body=%s", responseID, firstRecorder.Body.String())
+		}
+		if got := gjson.GetBytes(firstRecorder.Body.Bytes(), "output.0.call_id").String(); got != "call_1" {
+			t.Fatalf("turn 1 function call id = %q, want call_1; body=%s", got, firstRecorder.Body.String())
+		}
+
+		secondPayload := fmt.Sprintf(`{
+			"model":%q,
+			"previous_response_id":%q,
+			"input":[{"type":"function_call_output","call_id":"call_1","output":"2"}],
+			"store":true
+		}`, model, responseID)
+		secondRecorder := performOpenAICompatWireRequest(t, server, "/v1/responses", secondPayload)
+		secondCaptured := <-requests
+		if secondCaptured.path != "/v1/responses" {
+			t.Fatalf("turn 2 upstream path = %q, want /v1/responses", secondCaptured.path)
+		}
+		if got := gjson.GetBytes(secondCaptured.body, "previous_response_id").String(); got != responseID {
+			t.Fatalf("turn 2 previous_response_id = %q, want %q; body=%s", got, responseID, secondCaptured.body)
+		}
+		if got := gjson.GetBytes(secondCaptured.body, "input.0.type").String(); got != "function_call_output" {
+			t.Fatalf("turn 2 input type = %q, want function_call_output; body=%s", got, secondCaptured.body)
+		}
+		if got := gjson.GetBytes(secondCaptured.body, "input.0.call_id").String(); got != "call_1" {
+			t.Fatalf("turn 2 call id = %q, want call_1; body=%s", got, secondCaptured.body)
+		}
+		if got := gjson.GetBytes(secondCaptured.body, "input.0.output").String(); got != "2" {
+			t.Fatalf("turn 2 function output = %q, want 2; body=%s", got, secondCaptured.body)
+		}
+		if got := gjson.GetBytes(secondRecorder.Body.Bytes(), "object").String(); got != "response" {
+			t.Fatalf("turn 2 downstream object = %q, want response; body=%s", got, secondRecorder.Body.String())
+		}
+	})
+
 	t.Run("responses SSE preserves Codex Responses Lite input", func(t *testing.T) {
 		server, model, requests := newOpenAICompatWireTestServer(t, "responses", true)
 		payload := fmt.Sprintf(`{
@@ -167,6 +220,10 @@ func newOpenAICompatWireTestServer(t *testing.T, wireAPI string, streamResponse 
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if strings.HasSuffix(r.URL.Path, "/responses") {
+			if gjson.GetBytes(body, "input.0.content.0.text").String() == "Call add in turn one." {
+				_, _ = io.WriteString(w, `{"id":"resp_turn_1","object":"response","status":"completed","output":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":"add","arguments":"{\"a\":1,\"b\":1}","status":"completed"}],"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}`)
+				return
+			}
 			_, _ = io.WriteString(w, `{"id":"resp_wire","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"{\"answer\":\"ok\"}"}]}],"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}`)
 			return
 		}
