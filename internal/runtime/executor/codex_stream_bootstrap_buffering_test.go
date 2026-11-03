@@ -1717,6 +1717,8 @@ func TestCodexWebsocketsExecutor_BootstrapBuffering_OverloadDirectlyAfterTimeout
 		}
 
 		<-bootstrapStarted
+		<-bootstrapStarted
+
 		// Advance clock past 10s timeout before writing any messages
 		clock.advance(11 * time.Second)
 
@@ -1768,6 +1770,8 @@ func TestCodexWebsocketsExecutor_BootstrapBuffering_StatusBearingErrorAfterTimeo
 		}
 
 		<-bootstrapStarted
+		<-bootstrapStarted
+
 		// Advance clock past 10s timeout before writing error frame
 		clock.advance(11 * time.Second)
 

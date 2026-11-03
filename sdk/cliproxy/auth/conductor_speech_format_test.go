@@ -18,7 +18,7 @@ func TestRequestToFormatKeepsMediaSources(t *testing.T) {
 	}
 	for _, tt := range cases {
 		t.Run(tt.source, func(t *testing.T) {
-			got := requestToFormat("xai", nil, cliproxyexecutor.Request{}, cliproxyexecutor.Options{
+			got := requestToFormat("xai", nil, nil, cliproxyexecutor.Request{}, cliproxyexecutor.Options{
 				SourceFormat: sdktranslator.FromString(tt.source),
 			})
 			if got.String() != tt.want {
@@ -27,7 +27,7 @@ func TestRequestToFormatKeepsMediaSources(t *testing.T) {
 		})
 	}
 
-	got := requestToFormat("xai", nil, cliproxyexecutor.Request{}, cliproxyexecutor.Options{
+	got := requestToFormat("xai", nil, nil, cliproxyexecutor.Request{}, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FormatOpenAI,
 	})
 	if got != sdktranslator.FormatCodex {
