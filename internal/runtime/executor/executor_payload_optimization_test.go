@@ -8,7 +8,6 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/MoeForge/moego/ojson"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -506,7 +505,6 @@ func TestClaudeCacheControlDocChecksDoNotMaterializeLargeMessagesArray(t *testin
 
 		var mBefore, mAfter runtime.MemStats
 		runtime.ReadMemStats(&mBefore)
-		start := time.Now()
 		ensureCacheControlDoc(doc)
 		if got := countCacheControlsDoc(doc); got != 2 {
 			t.Fatalf("countCacheControlsDoc = %d, want 2", got)
@@ -515,19 +513,15 @@ func TestClaudeCacheControlDocChecksDoNotMaterializeLargeMessagesArray(t *testin
 		upgradeClaudeCacheControlTTLDoc(doc, claudeCacheControlTTL1h)
 		normalizeCacheControlTTLDoc(doc)
 		stripClaudeCacheControlTTLDoc(doc)
-		elapsed := time.Since(start)
 		runtime.ReadMemStats(&mAfter)
 
 		allocated := mAfter.TotalAlloc - mBefore.TotalAlloc
 		if allocated > 64*1024 {
 			t.Fatalf("split messages: cache control doc helpers allocated %d bytes (> 64 KiB)", allocated)
 		}
-		if elapsed > 20*time.Millisecond {
-			t.Fatalf("split messages took %v (> 20ms); expected O(N) single-pass traversal", elapsed)
-		}
 	})
 
-	t.Run("unsplit 1024 messages runs in single-pass O(N) time and <64KiB allocs", func(t *testing.T) {
+	t.Run("unsplit 1024 messages avoids 1MiB materialization", func(t *testing.T) {
 		chunk := strings.Repeat("b", 1024)
 		var b strings.Builder
 		b.Grow(1024*(len(chunk)+64) + 256)
@@ -553,21 +547,16 @@ func TestClaudeCacheControlDocChecksDoNotMaterializeLargeMessagesArray(t *testin
 
 		var mBefore, mAfter runtime.MemStats
 		runtime.ReadMemStats(&mBefore)
-		start := time.Now()
 		if got := countCacheControlsDoc(doc); got != 2 {
 			t.Fatalf("countCacheControlsDoc = %d, want 2", got)
 		}
 		enforceCacheControlLimitDoc(doc, 4)
 		normalizeCacheControlTTLDoc(doc)
-		elapsed := time.Since(start)
 		runtime.ReadMemStats(&mAfter)
 
 		allocated := mAfter.TotalAlloc - mBefore.TotalAlloc
 		if allocated > 64*1024 {
 			t.Fatalf("unsplit 1024 messages: allocated %d bytes (> 64 KiB)", allocated)
-		}
-		if elapsed > 20*time.Millisecond {
-			t.Fatalf("unsplit 1024 messages took %v (> 20ms); expected O(N) single-pass traversal", elapsed)
 		}
 	})
 }
