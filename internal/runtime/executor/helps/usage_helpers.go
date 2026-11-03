@@ -1222,7 +1222,7 @@ func (b *StreamUsageBuffer) ObserveOpenAIStream(line []byte) {
 	usageOK := false
 	if hasUsageCandidate || hasCacheCandidate {
 		root := util.ParseGJSONBytesNoCopy(payload)
-		usageNode := root.Get("usage")
+		usageNode := openAIStyleUsageNode(root)
 		detail, usageOK = parseOpenAIStyleUsageWithCache(root, usageNode)
 		if detail.ToolUsageDetails != nil && detail.ToolUsageDetails.ToolCallsRequested != nil {
 			b.openAIExplicitToolCalls = true
@@ -1713,7 +1713,7 @@ func ParseOpenAIUsage(data []byte) usage.Detail {
 		responseServiceTier = extractResponseServiceTier(data)
 	}
 	root := util.ParseGJSONBytesNoCopy(data)
-	usageNode := root.Get("usage")
+	usageNode := openAIStyleUsageNode(root)
 	detail, _ := parseOpenAIStyleUsageWithCache(root, usageNode)
 	detail.ResponseServiceTier = responseServiceTier
 	if detail.UpstreamServiceTier == "" {
@@ -2682,7 +2682,7 @@ func ParseOpenAIStreamUsage(line []byte) (usage.Detail, bool) {
 		return usage.Detail{}, false
 	}
 	root := util.ParseGJSONBytesNoCopy(payload)
-	detail, ok := parseOpenAIStyleUsageWithCache(root, root.Get("usage"))
+	detail, ok := parseOpenAIStyleUsageWithCache(root, openAIStyleUsageNode(root))
 	detail.ResponseServiceTier = extractResponseServiceTierFromValidJSON(payload)
 	if detail.UpstreamServiceTier == "" {
 		detail.UpstreamServiceTier = detail.ResponseServiceTier
@@ -3772,7 +3772,7 @@ func extractResponseServiceTier(payload []byte) string {
 }
 
 func extractResponseServiceTierFromValidJSON(payload []byte) string {
-	for _, path := range []string{"response.service_tier", "service_tier", "interaction.service_tier"} {
+	for _, path := range []string{"response.service_tier", "service_tier", "interaction.service_tier", "data.service_tier", "result.service_tier"} {
 		if tier := strings.TrimSpace(ojson.GetBytesNoCopy(payload, path).String()); tier != "" {
 			return strings.Clone(tier)
 		}
