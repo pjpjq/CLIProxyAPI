@@ -119,6 +119,28 @@ func lookupTunnelPeer(t *testing.T, hub *Hub, key, uuid string) *peer {
 	return tenant.peers[uuid]
 }
 
+func waitForTunnelPeer(t *testing.T, hub *Hub, key, uuid string) {
+	t.Helper()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for {
+		hub.mu.RLock()
+		tenant := hub.realms[key]
+		registered := tenant != nil && tenant.peers[uuid] != nil
+		hub.mu.RUnlock()
+		if registered {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("peer %s did not finish registration", uuid)
+		case <-tick.C:
+		}
+	}
+}
+
 func assertTunnelClose(t *testing.T, conn *websocket.Conn, code int) {
 	t.Helper()
 	_, _, errRead := readTunnelTestMessage(conn)
@@ -308,6 +330,7 @@ func TestHubBudget_ExhaustedTenantDoesNotStarveAnotherTenant(t *testing.T) {
 	t.Cleanup(srv.Close)
 	t.Cleanup(hub.Close)
 	serverB := dialRole(t, srv.URL, "b", RoleServer, "s", "Server")
+	waitForTunnelPeer(t, hub, "b", "s")
 	clientB := dialRole(t, srv.URL, "b", RoleClient, "c", "Client")
 	_ = readTextJSONFrame(t, clientB)
 
