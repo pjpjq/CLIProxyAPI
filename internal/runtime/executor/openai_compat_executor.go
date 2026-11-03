@@ -127,6 +127,10 @@ func (e *OpenAICompatExecutor) executeWithCredentials(ctx context.Context, auth 
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("openai")
 	endpoint := "/chat/completions"
+	if e.useNativeResponsesWire(auth, opts) {
+		to = sdktranslator.FormatOpenAIResponse
+		endpoint = "/responses"
+	}
 	if opts.Alt == "responses/compact" {
 		to = sdktranslator.FromString("openai-response")
 		endpoint = "/responses/compact"
@@ -364,6 +368,12 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("openai")
+	endpoint := "/chat/completions"
+	nativeResponses := e.useNativeResponsesWire(auth, opts)
+	if nativeResponses {
+		to = sdktranslator.FormatOpenAIResponse
+		endpoint = "/responses"
+	}
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
@@ -398,9 +408,11 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 
 	// Request usage data in the final streaming chunk so that token statistics
 	// are captured even when the upstream is an OpenAI-compatible provider.
-	helps.SetBoolIfDifferentDoc(doc, "stream_options.include_usage", true)
+	if !nativeResponses {
+		helps.SetBoolIfDifferentDoc(doc, "stream_options.include_usage", true)
+	}
 
-	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
+	url := strings.TrimSuffix(baseURL, "/") + endpoint
 	helps.ApplyPayloadConfigWithRequestDoc(e.cfg, baseModel, to.String(), from.String(), "", doc, originalTranslated, requestedModel, requestPath, opts.Headers)
 	translated = doc.Bytes()
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
@@ -477,6 +489,7 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 		var streamAborted bool
 		var upstreamEvent string
 		var frameData [][]byte
+		nativeTerminalSeen := false
 		defer streamUsage.Publish(ctx, reporter)
 
 		publishStreamError := func(streamErr statusErr, containsPayload bool) {
@@ -526,6 +539,12 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 				publishStreamError(statusErr{code: http.StatusBadGateway, msg: "upstream stream ended with incomplete SSE data frame"}, false)
 				return true
 			}
+			if nativeResponses && !isDone {
+				if streamErr, _, ok := codexTerminalFailureErr(dataPayload); ok {
+					publishStreamError(streamErr, true)
+					return true
+				}
+			}
 			if !isDone {
 				if streamErr, isError := openAICompatStreamDataError(dataPayload, eventName); isError {
 					publishStreamError(streamErr, true)
@@ -556,9 +575,32 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 				publishStreamError(statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}, false)
 				return true
 			}
-			if isDone {
+			if nativeResponses {
+				switch ojson.GetBytesNoCopy(dataPayload, "type").String() {
+				case "response.completed", "response.incomplete":
+					nativeTerminalSeen = true
+					return true
+				}
+			}
+			if !nativeResponses && isDone {
 				seenDone = true
 				return true
+			}
+			return false
+		}
+
+		publishNativeMetadata := func(line []byte) bool {
+			if !nativeResponses {
+				return false
+			}
+			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, bytes.Clone(line), &param, claudeInputTokens)
+			for i := range chunks {
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+				case <-ctx.Done():
+					streamAborted = true
+					return true
+				}
 			}
 			return false
 		}
@@ -581,9 +623,15 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 			}
 			if bytes.HasPrefix(trimmedLine, []byte("event:")) {
 				upstreamEvent = strings.TrimSpace(string(trimmedLine[len("event:"):]))
+				if publishNativeMetadata(line) {
+					break scanLoop
+				}
 				continue
 			}
 			if bytes.HasPrefix(trimmedLine, []byte(":")) || bytes.HasPrefix(trimmedLine, []byte("id:")) || bytes.HasPrefix(trimmedLine, []byte("retry:")) {
+				if publishNativeMetadata(line) {
+					break scanLoop
+				}
 				continue
 			}
 			if bytes.HasPrefix(trimmedLine, []byte("{")) || bytes.HasPrefix(trimmedLine, []byte("[")) {
@@ -626,7 +674,16 @@ func (e *OpenAICompatExecutor) executeStreamWithCredentials(ctx context.Context,
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():
 			}
-		} else if !seenDone {
+		} else if nativeResponses && !nativeTerminalSeen {
+			streamErr := newOpenAICompatIncompleteStreamError()
+			helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+			reporter.PublishFailure(ctx, streamErr)
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+			case <-ctx.Done():
+			}
+			return
+		} else if !nativeResponses && !seenDone {
 			// Without a translator-confirmed terminal state, a clean Responses or Claude EOF
 			// without [DONE] remains a failed stream instead of completing it.
 			if responseFormat == sdktranslator.FormatOpenAIResponse || (responseFormat == sdktranslator.FormatClaude && !sawFinishReason) {

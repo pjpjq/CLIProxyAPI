@@ -7,8 +7,8 @@ import (
 )
 
 const (
-	defaultRetentionSeconds int64 = 60
-	maxRetentionSeconds     int64 = 3600
+	defaultRetentionSeconds int64 = 86400
+	maxRetentionSeconds     int64 = 604800
 	usageSubscriberBuffer         = 256
 	errorSubscriberBuffer         = 256
 
