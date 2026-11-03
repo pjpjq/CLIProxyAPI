@@ -25,6 +25,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/buildinfo"
 	claudemodels "github.com/router-for-me/CLIProxyAPI/v8/internal/client/claude/models"
 	codexmodels "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/models"
 	proxyconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -691,6 +692,25 @@ func TestNewServerAppliesTrustedProxyConfiguration(t *testing.T) {
 
 func TestHealthz(t *testing.T) {
 	server := newTestServer(t)
+	const (
+		version = "v8.0.78"
+		commit  = "test-healthz-commit"
+	)
+	previousVersion, previousCommit := buildinfo.Version, buildinfo.Commit
+	buildinfo.Version, buildinfo.Commit = version, commit
+	t.Cleanup(func() { buildinfo.Version, buildinfo.Commit = previousVersion, previousCommit })
+	checkHeaders := func(t *testing.T, header http.Header) {
+		t.Helper()
+		for name, want := range map[string]string{
+			"Cache-Control": "no-store",
+			"X-CPA-VERSION": version,
+			"X-CPA-COMMIT":  commit,
+		} {
+			if got := header.Get(name); got != want {
+				t.Errorf("header %s = %q, want %q", name, got, want)
+			}
+		}
+	}
 
 	t.Run("GET", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -700,6 +720,7 @@ func TestHealthz(t *testing.T) {
 		if rr.Code != http.StatusOK {
 			t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
 		}
+		checkHeaders(t, rr.Header())
 
 		var resp struct {
 			Status string `json:"status"`
@@ -720,6 +741,7 @@ func TestHealthz(t *testing.T) {
 		if rr.Code != http.StatusOK {
 			t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
 		}
+		checkHeaders(t, rr.Header())
 		if rr.Body.Len() != 0 {
 			t.Fatalf("expected empty body for HEAD request, got %q", rr.Body.String())
 		}
@@ -2226,8 +2248,8 @@ func TestModelsWithClientVersionReturnsCodexCatalog(t *testing.T) {
 		t.Fatalf("gpt-5.5 max_tokens = %v, want 64000", gpt55["max_tokens"])
 	}
 	serviceTiers, ok := gpt55["service_tiers"].([]any)
-	if !ok || len(serviceTiers) != 1 {
-		t.Fatalf("expected gpt-5.5 priority service tier, got %#v", gpt55["service_tiers"])
+	if !ok || len(serviceTiers) != 0 {
+		t.Fatalf("expected gpt-5.5 service_tiers = [], got %#v", gpt55["service_tiers"])
 	}
 	if custom == nil {
 		t.Fatal("expected custom model codex catalog entry")
