@@ -17,15 +17,37 @@ import (
 
 type captureClaudeUsagePlugin struct {
 	records chan usage.Record
+	baseURL string
 }
 
 func (p *captureClaudeUsagePlugin) HandleUsage(_ context.Context, record usage.Record) {
-	if p == nil || record.Provider != "claude" {
+	if p == nil || record.Provider != "claude" || (p.baseURL != "" && record.BaseURL != p.baseURL) {
 		return
 	}
 	select {
 	case p.records <- record:
 	default:
+	}
+}
+
+func TestCaptureClaudeUsagePluginIgnoresOtherUpstreams(t *testing.T) {
+	plugin := &captureClaudeUsagePlugin{
+		records: make(chan usage.Record, 4),
+		baseURL: "http://current.test",
+	}
+	plugin.HandleUsage(context.Background(), usage.Record{Provider: "claude", BaseURL: "http://other.test"})
+	plugin.HandleUsage(context.Background(), usage.Record{Provider: "other", BaseURL: plugin.baseURL})
+	plugin.HandleUsage(context.Background(), usage.Record{Provider: "claude", BaseURL: plugin.baseURL})
+	select {
+	case record := <-plugin.records:
+		if record.Provider != "claude" || record.BaseURL != plugin.baseURL {
+			t.Fatalf("captured unrelated usage record: %+v", record)
+		}
+	default:
+		t.Fatal("missing usage record for current upstream")
+	}
+	if len(plugin.records) != 0 {
+		t.Fatal("captured extra usage records")
 	}
 }
 
@@ -69,6 +91,7 @@ func TestClaudeExecutor_ExecuteStream_Translated_ClientDisconnectAfterTerminalEv
 	pluginName := "test-claude-translated-disconnect"
 	plugin := &captureClaudeUsagePlugin{
 		records: make(chan usage.Record, 4),
+		baseURL: server.URL,
 	}
 	usage.RegisterNamedPlugin(pluginName, plugin)
 	t.Cleanup(func() {
@@ -165,6 +188,7 @@ func TestClaudeExecutor_ExecuteStream_Passthrough_ClientDisconnectAfterTerminalE
 	pluginName := "test-claude-passthrough-disconnect"
 	plugin := &captureClaudeUsagePlugin{
 		records: make(chan usage.Record, 4),
+		baseURL: server.URL,
 	}
 	usage.RegisterNamedPlugin(pluginName, plugin)
 	t.Cleanup(func() {

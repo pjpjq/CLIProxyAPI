@@ -2642,6 +2642,7 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_WithSession(t *testing.T) {
 	serverPongCh := make(chan string, 1)
 	inWriteHook := make(chan struct{})
 	pongDeliveredDuringWrite := make(chan struct{})
+	clientRequestRead := make(chan error, 1)
 
 	testWebsocketWritePayloadHook = func(conn *websocket.Conn) {
 		close(inWriteHook)
@@ -2668,14 +2669,9 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_WithSession(t *testing.T) {
 		})
 
 		// Start server reader loop so server processes control frames.
-		readErrCh := make(chan error, 1)
 		go func() {
-			for {
-				if _, _, errRead := conn.ReadMessage(); errRead != nil {
-					readErrCh <- errRead
-					return
-				}
-			}
+			_, _, errRead := conn.ReadMessage()
+			clientRequestRead <- errRead
 		}()
 
 		// Wait until client has entered writeMessage and is actively holding writeMu.
@@ -2698,6 +2694,17 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_WithSession(t *testing.T) {
 			close(pongDeliveredDuringWrite)
 		case <-time.After(2 * time.Second):
 			t.Errorf("pong was not received while payload write was in progress")
+			return
+		}
+
+		select {
+		case errRead := <-clientRequestRead:
+			if errRead != nil {
+				t.Errorf("read codex session request: %v", errRead)
+				return
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("timed out waiting for codex session request payload")
 			return
 		}
 
@@ -2742,6 +2749,7 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_Sessionless(t *testing.T) {
 	serverPongCh := make(chan string, 1)
 	inWriteHook := make(chan struct{})
 	pongDeliveredDuringWrite := make(chan struct{})
+	clientRequestRead := make(chan error, 1)
 
 	testWebsocketWritePayloadHook = func(conn *websocket.Conn) {
 		close(inWriteHook)
@@ -2767,11 +2775,8 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_Sessionless(t *testing.T) {
 		})
 
 		go func() {
-			for {
-				if _, _, errRead := conn.ReadMessage(); errRead != nil {
-					return
-				}
-			}
+			_, _, errRead := conn.ReadMessage()
+			clientRequestRead <- errRead
 		}()
 
 		// Wait until client has entered writeMessage on sessionless path.
@@ -2794,6 +2799,17 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_Sessionless(t *testing.T) {
 			close(pongDeliveredDuringWrite)
 		case <-time.After(2 * time.Second):
 			t.Errorf("pong was not received while payload write was in progress on sessionless connection")
+			return
+		}
+
+		select {
+		case errRead := <-clientRequestRead:
+			if errRead != nil {
+				t.Errorf("read codex sessionless request: %v", errRead)
+				return
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("timed out waiting for codex sessionless request payload")
 			return
 		}
 
@@ -2834,6 +2850,7 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_NonstreamSessionless(t *testi
 	serverPongCh := make(chan string, 1)
 	inWriteHook := make(chan struct{})
 	pongDeliveredDuringWrite := make(chan struct{})
+	clientRequestRead := make(chan error, 1)
 
 	testWebsocketWritePayloadHook = func(conn *websocket.Conn) {
 		close(inWriteHook)
@@ -2859,11 +2876,8 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_NonstreamSessionless(t *testi
 		})
 
 		go func() {
-			for {
-				if _, _, errRead := conn.ReadMessage(); errRead != nil {
-					return
-				}
-			}
+			_, _, errRead := conn.ReadMessage()
+			clientRequestRead <- errRead
 		}()
 
 		// Wait until client has entered writeMessage on nonstream path.
@@ -2886,6 +2900,17 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_NonstreamSessionless(t *testi
 			close(pongDeliveredDuringWrite)
 		case <-time.After(2 * time.Second):
 			t.Errorf("pong was not received while payload write was in progress on nonstream sessionless connection")
+			return
+		}
+
+		select {
+		case errRead := <-clientRequestRead:
+			if errRead != nil {
+				t.Errorf("read codex nonstream sessionless request: %v", errRead)
+				return
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("timed out waiting for codex nonstream sessionless request payload")
 			return
 		}
 
