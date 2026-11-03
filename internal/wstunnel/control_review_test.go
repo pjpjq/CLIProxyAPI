@@ -172,12 +172,15 @@ func TestPeerControl_PendingPongIsBoundedAndKeepsLatestPayload(t *testing.T) {
 func TestPeerControl_UnknownWebSocketOpcodeIsFatalProtocolError(t *testing.T) {
 	for _, opcode := range []byte{0x3, 0x7, 0xb, 0xf} {
 		t.Run(fmt.Sprintf("opcode=%x", opcode), func(t *testing.T) {
-			hub := NewHub(Options{})
+			hub := NewHub(Options{PingInterval: time.Hour})
 			hub.UpdateAllowedAPIKeys([]string{"key"})
 			srv := newDeadlineTrackingTunnelServer(t, hub)
 			client := dialRole(t, srv.URL, "key", RoleClient, "device", "Device")
 			_ = readTextJSONFrame(t, client)
 			p := lookupTunnelPeer(t, hub, "key", "device")
+			// Receiving the server list does not guarantee WriteMessage has returned.
+			p.writeMu.Lock()
+			p.writeMu.Unlock()
 			transport := p.conn.UnderlyingConn().(*deadlineGuardConn).Conn.(*deadlineTrackingTunnelConn)
 			transport.monitoring.Store(true)
 			// Send a final, masked, empty frame using a reserved data/control opcode.

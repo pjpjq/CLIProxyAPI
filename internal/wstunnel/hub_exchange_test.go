@@ -73,6 +73,9 @@ func TestHubExchange_TenantIsolation(t *testing.T) {
 	srv1 := dialRole(t, srv.URL, "key-1", RoleServer, "shared-srv-uuid", "Tenant1-Server")
 	srv2 := dialRole(t, srv.URL, "key-2", RoleServer, "shared-srv-uuid", "Tenant2-Server")
 	_ = dialRole(t, srv.URL, "key-2", RoleServer, "only-in-tenant-2", "Secret-Server-2")
+	waitForTunnelPeer(t, hub, "key-1", "shared-srv-uuid")
+	waitForTunnelPeer(t, hub, "key-2", "shared-srv-uuid")
+	waitForTunnelPeer(t, hub, "key-2", "only-in-tenant-2")
 
 	cli1 := dialRole(t, srv.URL, "key-1", RoleClient, "shared-cli-uuid", "Tenant1-Client")
 	cli2 := dialRole(t, srv.URL, "key-2", RoleClient, "shared-cli-uuid", "Tenant2-Client")
@@ -247,7 +250,9 @@ func TestHubExchange_ManyToManyFullDuplexMultiplexing(t *testing.T) {
 	servers := make([]*websocket.Conn, numPeers)
 	serverWriteMu := make([]sync.Mutex, numPeers)
 	for s := 0; s < numPeers; s++ {
-		servers[s] = dialRole(t, srv.URL, "key-mesh", RoleServer, fmt.Sprintf("srv-%d", s), fmt.Sprintf("Server %d", s))
+		uuid := fmt.Sprintf("srv-%d", s)
+		servers[s] = dialRole(t, srv.URL, "key-mesh", RoleServer, uuid, fmt.Sprintf("Server %d", s))
+		waitForTunnelPeer(t, hub, "key-mesh", uuid)
 	}
 
 	clients := make([]*websocket.Conn, numPeers)
