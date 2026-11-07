@@ -2,15 +2,17 @@ package auth
 
 import (
 	"bytes"
+	"context"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 func (m *Manager) lookupAPIKeyUpstreamModel(authID, requestedModel string) string {
@@ -301,6 +303,10 @@ func executionResultModel(routeModel, upstreamModel string, pooled bool) string 
 }
 
 func (m *Manager) filterExecutionModels(auth *Auth, routeModel string, candidates []string, pooled bool) []string {
+	return m.filterExecutionModelsForRequest(nil, auth, routeModel, candidates, pooled)
+}
+
+func (m *Manager) filterExecutionModelsForRequest(ctx context.Context, auth *Auth, routeModel string, candidates []string, pooled bool, clientHeaders ...http.Header) []string {
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -308,7 +314,7 @@ func (m *Manager) filterExecutionModels(auth *Auth, routeModel string, candidate
 	out := make([]string, 0, len(candidates))
 	for _, upstreamModel := range candidates {
 		stateModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
-		blocked, _, _ := isAuthBlockedForModel(auth, stateModel, now)
+		blocked, _, _ := isAuthBlockedForModelForRequest(ctx, auth, stateModel, now, clientHeaders...)
 		if blocked {
 			continue
 		}
@@ -324,8 +330,12 @@ func (m *Manager) preparedExecutionModels(auth *Auth, routeModel string) ([]stri
 }
 
 func (m *Manager) preparedExecutionModelsWithAlias(auth *Auth, routeModel string) ([]string, bool, OAuthModelAliasResult, *apiKeyModelRoutingSnapshot) {
+	return m.preparedExecutionModelsWithAliasForRequest(nil, auth, routeModel)
+}
+
+func (m *Manager) preparedExecutionModelsWithAliasForRequest(ctx context.Context, auth *Auth, routeModel string, clientHeaders ...http.Header) ([]string, bool, OAuthModelAliasResult, *apiKeyModelRoutingSnapshot) {
 	candidates, pooled, aliasResult, routing := m.executionModelCandidatesWithAlias(auth, routeModel)
-	return m.filterExecutionModels(auth, routeModel, candidates, pooled), pooled, aliasResult, routing
+	return m.filterExecutionModelsForRequest(ctx, auth, routeModel, candidates, pooled, clientHeaders...), pooled, aliasResult, routing
 }
 
 func (m *Manager) executionModelCandidatesWithAlias(auth *Auth, routeModel string) ([]string, bool, OAuthModelAliasResult, *apiKeyModelRoutingSnapshot) {
