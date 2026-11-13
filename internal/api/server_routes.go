@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/middleware"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/buildinfo"
 	claudemodels "github.com/router-for-me/CLIProxyAPI/v8/internal/client/claude/models"
 	codexlive "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/live"
 	codexmodels "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/models"
@@ -45,6 +46,9 @@ const codexAlphaSearchSourceFormat = "codex-alpha-search"
 // It defines the endpoints and associates them with their respective handlers.
 func (s *Server) setupRoutes() {
 	healthzHandler := func(c *gin.Context) {
+		c.Header("Cache-Control", "no-store")
+		c.Header("X-CPA-VERSION", buildinfo.Version)
+		c.Header("X-CPA-COMMIT", buildinfo.Commit)
 		if c.Request.Method == http.MethodHead {
 			c.Status(http.StatusOK)
 			return
