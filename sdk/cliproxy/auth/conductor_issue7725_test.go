@@ -32,7 +32,7 @@ func TestApplyRequestAfterAuthInterceptorClonesMetadataBeforeSessionMutation_Iss
 			},
 		}
 
-		_, finalOpts, errIntercept := applyRequestAfterAuthInterceptor(context.Background(), nil, "openai", req, opts, "gpt-5.6-luna")
+		_, finalOpts, errIntercept := applyRequestAfterAuthInterceptor(context.Background(), nil, nil, "openai", req, opts, "gpt-5.6-luna")
 		if errIntercept != nil {
 			t.Fatalf("applyRequestAfterAuthInterceptor error = %v", errIntercept)
 		}
@@ -72,7 +72,7 @@ func TestApplyRequestAfterAuthInterceptorClonesMetadataBeforeSessionMutation_Iss
 			},
 		}
 
-		_, finalOpts, errIntercept := applyRequestAfterAuthInterceptor(context.Background(), nil, "openai", req, opts, "gpt-5.6-luna")
+		_, finalOpts, errIntercept := applyRequestAfterAuthInterceptor(context.Background(), nil, nil, "openai", req, opts, "gpt-5.6-luna")
 		if errIntercept != nil {
 			t.Fatalf("applyRequestAfterAuthInterceptor error = %v", errIntercept)
 		}
@@ -111,7 +111,7 @@ func TestApplyRequestAfterAuthInterceptorClonesMetadataBeforeSessionMutation_Iss
 			},
 		}
 
-		_, finalOpts, errIntercept := applyRequestAfterAuthInterceptor(context.Background(), nil, "openai", req, opts, "gpt-5.6-luna")
+		_, finalOpts, errIntercept := applyRequestAfterAuthInterceptor(context.Background(), nil, nil, "openai", req, opts, "gpt-5.6-luna")
 		if errIntercept != nil {
 			t.Fatalf("applyRequestAfterAuthInterceptor error = %v", errIntercept)
 		}
