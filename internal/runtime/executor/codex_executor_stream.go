@@ -78,7 +78,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, err
 	}
 
-	ctx = helps.WithPayloadFinalizer(ctx, helps.NewPayloadFinalizer(e.cfg, e.Identifier(), baseModel, to.String(), "", originalTranslated, req, opts, auth))
+	payloadCtx := helps.WithPayloadFinalizer(ctx, helps.NewPayloadFinalizer(e.cfg, e.Identifier(), baseModel, to.String(), "", originalTranslated, req, opts, auth))
 	_ = doc.Delete("previous_response_id")
 	_ = doc.Delete("generate")
 	_ = doc.Delete("prompt_cache_retention")
@@ -123,10 +123,12 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	sanitizeOpenAIResponsesReasoningEncryptedContentWithCompatModelAndBaseURLDoc(ctx, "codex executor", doc, isCompat, targetModel, baseURL)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
-	httpReq, upstreamBody, err := e.cacheHelperDoc(ctx, from, url, req, doc, auth, opts.Headers)
+	httpReq, upstreamBody, err := e.cacheHelperDoc(payloadCtx, from, url, req, doc, auth, opts.Headers)
 	if err != nil {
 		return nil, err
 	}
+	// The finalizer's copy of the original payload is not needed during transport or usage dispatch.
+	httpReq = httpReq.WithContext(ctx)
 	body = upstreamBody
 	upstreamModel := strings.TrimSpace(doc.Get("model").String())
 	if upstreamModel != "" && upstreamModel != baseModel {

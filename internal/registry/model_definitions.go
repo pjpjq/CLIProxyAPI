@@ -634,24 +634,21 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 	}
 
 	data := getModels()
-	allModels := [][]*ModelInfo{
-		data.Claude,
-		data.Gemini,
-		data.Vertex,
-		data.AIStudio,
-		data.CodexPro,
-		data.Kimi,
-		data.Antigravity,
-		data.XAI,
-		GetDevinModels(),
-		GetMetaModels(),
-	}
-	for _, models := range allModels {
-		for _, m := range models {
-			if m != nil && m.ID == modelID {
-				return cloneModelInfo(m)
+	lookup := func(catalogs ...[]*ModelInfo) *ModelInfo {
+		for _, models := range catalogs {
+			for _, m := range models {
+				if m != nil && m.ID == modelID {
+					return cloneModelInfo(m)
+				}
 			}
 		}
+		return nil
+	}
+	if model := lookup(data.Claude, data.Gemini, data.Vertex, data.AIStudio, data.CodexPro, data.Kimi, data.Antigravity, data.XAI); model != nil {
+		return model
+	}
+	if model := lookup(WithDevinBuiltins(devinModelsSnapshot()), data.Meta); model != nil {
+		return model
 	}
 
 	// Dated and bracketed Claude variants (claude-sonnet-5-5-20261001,
