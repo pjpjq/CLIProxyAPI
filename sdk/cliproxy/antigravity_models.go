@@ -891,14 +891,14 @@ func (s *Service) refreshAntigravityModels(ctx context.Context) {
 	// A version change also invalidates connected probes. Cancel them before
 	// queuing successors so a stalled old request cannot hold its account worker.
 	s.cancelStaleAntigravityProbes("")
-	for _, auth := range s.coreManager.List() {
+	for _, auth := range s.coreManager.ListModelRefreshCandidates("antigravity") {
 		if ctx.Err() != nil {
 			return
 		}
 		if auth == nil || shouldSkipAntigravityModelProbe(auth, antigravityNowFunc()) || !strings.EqualFold(auth.Provider, "antigravity") {
 			continue
 		}
-		snapshot := auth.Clone()
+		snapshot := auth
 		key := s.antigravityCapabilityKey(snapshot)
 		token, _ := snapshot.Metadata["access_token"].(string)
 		failureKey := antigravityTokenFailureKey(key, strings.TrimSpace(token))
@@ -929,7 +929,7 @@ func (s *Service) nextAntigravityModelRefreshDelay() time.Duration {
 	if s == nil || s.coreManager == nil || s.antigravityHomeEnabled() {
 		return antigravityRefreshScanInterval
 	}
-	for _, auth := range s.coreManager.List() {
+	for _, auth := range s.coreManager.ListModelRefreshCandidates("antigravity") {
 		if auth == nil || shouldSkipAntigravityModelProbe(auth, now) || !strings.EqualFold(auth.Provider, "antigravity") {
 			continue
 		}
