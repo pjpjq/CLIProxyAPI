@@ -230,6 +230,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 		}
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
 			if chunk.Err != nil && !failed {
+				resultCtx := ctx
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					if retryAfterFromError(chunk.Err) != nil {
 						m.recordCanceledUpstreamCooldown(ctx, auth, provider, resultModel, routeModel, opts, chunk.Err, ephemeralResult, executionSeq)
@@ -237,8 +238,12 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 						return false
 					}
 					if !isRequestScopedError(chunk.Err) {
-						failed = true
-						return false
+						// A classified upstream 502 may arrive after its SSE error caused cancellation.
+						if statusCodeFromError(chunk.Err) != http.StatusBadGateway || errorCodeFromError(chunk.Err) != transientTransportErrorCode {
+							failed = true
+							return false
+						}
+						resultCtx = context.WithoutCancel(ctx)
 					}
 				}
 				failed = true
@@ -250,7 +255,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 				result.RetryAfter = retryAfterFromError(chunk.Err)
 				result.CredentialScope = isCredentialScopedError(chunk.Err)
 				applyRequestScopedActionToResult(action, okAction, &result)
-				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
+				m.recordExecutionResult(resultCtx, result, auth, ephemeralResult)
 				if okAction && !isRequestTerminatedError(chunk.Err) && !isRequestStopError(chunk.Err) && !isTOSViolationError(chunk.Err) {
 					if isRequestScopedStop(action, okAction) {
 						chunk.Err = wrapRequestStopError(chunk.Err)
@@ -531,7 +536,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		}
 		execOpts := opts
 		var errIntercept error
-		execReq, execOpts, errIntercept = applyRequestAfterAuthInterceptor(ctx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+		execReq, execOpts, errIntercept = applyRequestAfterAuthInterceptor(ctx, executor, auth, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 		if errIntercept != nil {
 			if isCredentialTerminatedError(errIntercept) {
 				if auth != nil {

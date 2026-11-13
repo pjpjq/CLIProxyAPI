@@ -570,6 +570,11 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 								// OAuth-only steering still leaves API keys in normal mode.
 								return
 							}
+							if provider == "codex" && (responsesWebsocketErrorStatus(handlers.ExecutionErrorMessage(disconnectErr)) == http.StatusTooManyRequests || isResponsesWebsocketQuotaOrCooldownError(disconnectErr)) {
+								// Codex already delivered the quota error to the active stream. Let
+								// its forwarder send the terminal frame after any in-flight data write.
+								return
+							}
 							if writer.closeForUpstreamDisconnect(disconnectErr, wsTimelineLog) && disconnectErr != nil {
 								recordedDisconnectErr.CompareAndSwap(nil, handlers.ExecutionErrorMessage(disconnectErr))
 							}
