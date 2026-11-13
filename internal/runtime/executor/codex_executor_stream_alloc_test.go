@@ -11,6 +11,7 @@ import (
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
@@ -37,6 +38,41 @@ func (tr codexAllocationTransport) RoundTrip(req *http.Request) (*http.Response,
 		Body:       io.NopCloser(strings.NewReader(tr.stream)),
 		Request:    req,
 	}, nil
+}
+
+func TestCodexStreamDoesNotRetainPayloadFinalizerInTransport(t *testing.T) {
+	cfg := &config.Config{Payload: config.PayloadConfig{Override: []config.PayloadRule{{
+		Models: []config.PayloadModelRule{{Name: "gpt-5.4", Protocol: "codex"}},
+		Params: map[string]any{"service_tier": "priority"},
+	}}}}
+	transport := codexAllocationTransport{stream: codexAllocationStream(1, 1)}
+	ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		defer req.Body.Close()
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		if got := ojson.GetBytes(body, "service_tier").String(); got != "priority" {
+			t.Errorf("upstream service_tier = %q, want priority", got)
+		}
+		probe := []byte(`{"model":"gpt-5.4"}`)
+		if out := helps.FinalizePayload(req.Context(), probe); !bytes.Equal(out, probe) {
+			t.Error("transport still carries the request payload finalizer")
+		}
+		return transport.RoundTrip(req)
+	}))
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "test"}}
+	request := cliproxyexecutor.Request{Model: "gpt-5.4", Payload: []byte(`{"model":"gpt-5.4","input":"hello"}`)}
+	opts := cliproxyexecutor.Options{Stream: true, SourceFormat: sdktranslator.FormatOpenAIResponse}
+	result, err := NewCodexExecutor(cfg).ExecuteStream(ctx, auth, request, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatal(chunk.Err)
+		}
+	}
 }
 
 func TestCodexStreamChunksRemainOwnedAfterScannerAdvances(t *testing.T) {
