@@ -66,19 +66,24 @@ func WithDevinBuiltins(models []*ModelInfo) []*ModelInfo {
 // It prioritizes the dynamic/embedded devin_models.json catalog, then models.json's devin section,
 // and finally hardcoded staticDevinModels.
 func GetDevinModels() []*ModelInfo {
+	return WithDevinBuiltins(cloneModelInfos(devinModelsSnapshot()))
+}
+
+// devinModelsSnapshot returns the immutable active catalog without copying every model.
+func devinModelsSnapshot() []*ModelInfo {
 	devinCatalogStore.mu.RLock()
 	models := devinCatalogStore.models
 	devinCatalogStore.mu.RUnlock()
 
 	if len(models) > 0 {
-		return WithDevinBuiltins(cloneModelInfos(models))
+		return models
 	}
 
 	if m := getModels(); m != nil && len(m.Devin) > 0 {
-		return WithDevinBuiltins(cloneModelInfos(m.Devin))
+		return m.Devin
 	}
 
-	return WithDevinBuiltins(cloneModelInfos(staticDevinModels))
+	return staticDevinModels
 }
 
 // LookupDevinModel looks up a model definition from the active Devin catalog.
