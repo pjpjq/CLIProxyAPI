@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 )
 
 func TestPendingStreamErrorReturnsBufferedError(t *testing.T) {
@@ -165,5 +165,55 @@ func TestSSEJSONValidationStateSplitCRLFVariants(t *testing.T) {
 				t.Fatalf("output mismatch: got %q, want %q", string(output), wantOutput)
 			}
 		})
+	}
+}
+
+func TestForwardStreamResetsKeepAliveOnEachChunk(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+
+	tickChan := make(chan time.Time)
+	data := make(chan []byte, 3)
+	errs := make(chan *interfaces.ErrorMessage)
+	close(errs)
+
+	resetCount := 0
+	restore := SetStreamingKeepAliveTickerWithResetFactoryForTest(func(time.Duration) (<-chan time.Time, func(), func()) {
+		return tickChan, func() {}, func() {
+			resetCount++
+		}
+	})
+	defer restore()
+
+	data <- []byte("buffered-without-output")
+	data <- []byte("data: {\"part\":1}\n\n")
+	data <- []byte("data: {\"part\":2}\n\n")
+	close(data)
+
+	interval := 20 * time.Second
+	h := &BaseAPIHandler{}
+	var canceled error
+	h.ForwardStream(c, recorder, func(err error) {
+		canceled = err
+	}, data, errs, StreamForwardOptions{
+		KeepAliveInterval: &interval,
+		WriteChunk: func(chunk []byte) {
+			if string(chunk) == "buffered-without-output" {
+				return
+			}
+			_, _ = c.Writer.Write(chunk)
+		},
+	})
+
+	if canceled != nil {
+		t.Fatalf("unexpected cancel error: %v", canceled)
+	}
+	if resetCount != 2 {
+		t.Fatalf("resetCount = %d, want 2", resetCount)
+	}
+	if got := recorder.Body.String(); got != "data: {\"part\":1}\n\ndata: {\"part\":2}\n\n" {
+		t.Fatalf("body = %q, want two data chunks", got)
 	}
 }

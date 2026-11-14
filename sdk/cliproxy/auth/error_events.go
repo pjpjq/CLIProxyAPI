@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
 )
 
 type errorEvent struct {
@@ -104,7 +104,7 @@ func errorEventModelStatusFrom(model string, authSnapshot *Auth) *errorEventMode
 	if model == "" || authSnapshot == nil || authSnapshot.ModelStates == nil {
 		return nil
 	}
-	state := authSnapshot.ModelStates[model]
+	state := existingModelState(authSnapshot, model)
 	if state == nil {
 		return nil
 	}
