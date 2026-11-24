@@ -53,9 +53,11 @@ func currentPluginAuthParser() PluginAuthParser {
 
 // FileTokenStore persists token records and auth metadata using the filesystem as backing storage.
 type FileTokenStore struct {
-	mu      sync.Mutex
-	dirLock sync.RWMutex
-	baseDir string
+	mu       sync.Mutex
+	dirLock  sync.RWMutex
+	baseDir  string
+	poolDir  string
+	vaultDir string
 }
 
 // NewFileTokenStore creates a token store that saves credentials to disk through the
@@ -64,8 +66,18 @@ func NewFileTokenStore() *FileTokenStore {
 	return &FileTokenStore{}
 }
 
+// NewPooledFileTokenStore lists the local projection and explicitly persists mutations in the vault.
+func NewPooledFileTokenStore(activeDir, vaultDir string) *FileTokenStore {
+	return &FileTokenStore{baseDir: activeDir, poolDir: activeDir, vaultDir: vaultDir}
+}
+
+func (s *FileTokenStore) AuthDir() string { return s.poolDir }
+
 // SetBaseDir updates the default directory used for auth JSON persistence when no explicit path is provided.
 func (s *FileTokenStore) SetBaseDir(dir string) {
+	if s.poolDir != "" {
+		return
+	}
 	s.dirLock.Lock()
 	s.baseDir = strings.TrimSpace(dir)
 	s.dirLock.Unlock()
@@ -89,20 +101,38 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		return "", fmt.Errorf("auth filestore: missing file path attribute for %s", auth.ID)
 	}
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	unlock, err := s.lockPool()
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
+	activePath := path
+	path = s.AuthoritativeAuthPath(activePath)
+	creating := cliproxyauth.HasAuthCreationIntent(ctx)
 	// Runtime updates must not recreate a disabled credential whose source file
 	// was deliberately removed. Login and migration callers explicitly mark the
 	// save when creating a missing disabled credential is intentional.
-	if auth.Disabled && !cliproxyauth.HasAuthCreationIntent(ctx) {
-		if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
-			return "", nil
+	if (auth.Disabled || path != activePath) && !creating {
+		if _, statErr := os.Stat(path); statErr != nil {
+			if os.IsNotExist(statErr) {
+				return "", nil
+			}
+			return "", statErr
 		}
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", fmt.Errorf("auth filestore: create dir failed: %w", err)
+	}
+	if ctx != nil && path != activePath {
+		if observed, ok := ctx.Value(pooledFileSaveKey{}).(*PooledFileSave); ok && !observed.Captured() {
+			if err := observed.capture(activePath, path); err != nil {
+				return "", err
+			}
+			defer func() { observed.after, observed.readError = readPooledFile(path) }()
+		}
 	}
 
 	// metadataSetter is a private interface for TokenStorage implementations that support metadata injection.
@@ -160,18 +190,21 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		}
 	}
 
+	if err := s.publishPoolFile(path, activePath, creating); err != nil {
+		return "", err
+	}
 	if auth.Attributes == nil {
 		auth.Attributes = make(map[string]string)
 	}
-	auth.Attributes[cliproxyauth.AttributePath] = path
-	auth.Attributes[cliproxyauth.AttributeSource] = path
+	auth.Attributes[cliproxyauth.AttributePath] = activePath
+	auth.Attributes[cliproxyauth.AttributeSource] = activePath
 	auth.Attributes[cliproxyauth.AttributeSourceBackend] = cliproxyauth.AuthSourceFile
 
 	if strings.TrimSpace(auth.FileName) == "" {
 		auth.FileName = auth.ID
 	}
 
-	return path, nil
+	return activePath, nil
 }
 
 // List enumerates all auth JSON files under the configured directory.
@@ -215,6 +248,18 @@ func (s *FileTokenStore) Delete(ctx context.Context, id string) error {
 	path, err := s.resolveDeletePath(id)
 	if err != nil {
 		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	unlock, err := s.lockPool()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if vaultPath := s.AuthoritativeAuthPath(path); vaultPath != path {
+		if err = os.Remove(vaultPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("auth filestore: delete from vault failed: %w", err)
+		}
 	}
 	if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("auth filestore: delete failed: %w", err)
