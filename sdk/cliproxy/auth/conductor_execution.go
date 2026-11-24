@@ -936,7 +936,7 @@ func prepareRequestAfterAuth(ctx context.Context, executor ProviderExecutor, aut
 	if opts.RequestAfterAuthInterceptor == nil {
 		return req, opts, nil
 	}
-	toFormat := requestToFormat(provider, executor, req, opts)
+	toFormat := requestToFormat(provider, executor, auth, req, opts)
 	resp := opts.RequestAfterAuthInterceptor(ctx, cliproxyexecutor.RequestAfterAuthInterceptRequest{
 		SourceFormat:   opts.SourceFormat,
 		ToFormat:       toFormat,
@@ -1023,7 +1023,14 @@ func prepareRequestAfterAuth(ctx context.Context, executor ProviderExecutor, aut
 	return req, opts, nil
 }
 
-func requestToFormat(provider string, executor ProviderExecutor, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) sdktranslator.Format {
+func requestToFormat(provider string, executor ProviderExecutor, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) sdktranslator.Format {
+	if resolver, ok := executor.(interface {
+		RequestToFormatWithAuth(*Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) sdktranslator.Format
+	}); ok {
+		if format := resolver.RequestToFormatWithAuth(auth, req, opts); format != "" {
+			return format
+		}
+	}
 	resolver, ok := executor.(requestToFormatResolver)
 	if ok && resolver != nil {
 		formatRequestTo := resolver.RequestToFormat(req, opts)

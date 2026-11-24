@@ -178,6 +178,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		return nil, nil
 	}
 	NormalizeCredentialMetadata(auth.Metadata)
+	applyXAIFailClosedProxy(auth)
 	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 		return nil, fmt.Errorf("register auth: %w", errWeight)
 	}
@@ -493,6 +494,7 @@ func (m *Manager) updateInternalLockedWithOptions(ctx context.Context, base, aut
 			NormalizeCredentialMetadata(auth.Metadata)
 		}
 	}
+	applyXAIFailClosedProxy(auth)
 	if auth.RegistrationEpoch != 0 && auth.RegistrationEpoch < m.authEpochs[auth.ID] {
 		m.mu.Unlock()
 		return nil, false, true, false, fmt.Errorf("update auth %s: stale registration epoch %d < %d", auth.ID, auth.RegistrationEpoch, m.authEpochs[auth.ID])
@@ -1008,6 +1010,7 @@ func (m *Manager) Load(ctx context.Context) error {
 			continue
 		}
 		NormalizeCredentialMetadata(auth.Metadata)
+		applyXAIFailClosedProxy(auth)
 		if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 			continue
 		}

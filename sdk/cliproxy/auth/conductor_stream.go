@@ -243,6 +243,7 @@ func (m *Manager) wrapStreamResultWithCancel(ctx context.Context, auth *Auth, pr
 		}
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
 			if chunk.Err != nil && !failed {
+				resultCtx := ctx
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					if retryAfterFromError(chunk.Err) != nil {
 						m.recordCanceledUpstreamCooldown(ctx, auth, provider, resultModel, routeModel, opts, chunk.Err, ephemeralResult, executionSeq)
@@ -250,8 +251,12 @@ func (m *Manager) wrapStreamResultWithCancel(ctx context.Context, auth *Auth, pr
 						return false
 					}
 					if !isRequestScopedError(chunk.Err) {
-						failed = true
-						return false
+						// A classified upstream 502 may arrive after its SSE error caused cancellation.
+						if statusCodeFromError(chunk.Err) != http.StatusBadGateway || errorCodeFromError(chunk.Err) != transientTransportErrorCode {
+							failed = true
+							return false
+						}
+						resultCtx = context.WithoutCancel(ctx)
 					}
 				}
 				failed = true
@@ -263,7 +268,7 @@ func (m *Manager) wrapStreamResultWithCancel(ctx context.Context, auth *Auth, pr
 				result.RetryAfter = retryAfterFromError(chunk.Err)
 				result.CredentialScope = isCredentialScopedError(chunk.Err)
 				applyRequestScopedActionToResult(action, okAction, &result)
-				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
+				m.recordExecutionResult(resultCtx, result, auth, ephemeralResult)
 				if okAction && !isRequestTerminatedError(chunk.Err) && !isRequestStopError(chunk.Err) && !isTOSViolationError(chunk.Err) {
 					if isRequestScopedStop(action, okAction) {
 						chunk.Err = wrapRequestStopError(chunk.Err)
