@@ -119,6 +119,28 @@ func lookupTunnelPeer(t *testing.T, hub *Hub, key, uuid string) *peer {
 	return tenant.peers[uuid]
 }
 
+func waitForTunnelPeer(t *testing.T, hub *Hub, key, uuid string) {
+	t.Helper()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for {
+		hub.mu.RLock()
+		tenant := hub.realms[key]
+		registered := tenant != nil && tenant.peers[uuid] != nil
+		hub.mu.RUnlock()
+		if registered {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("peer %s did not finish registration", uuid)
+		case <-tick.C:
+		}
+	}
+}
+
 func assertTunnelClose(t *testing.T, conn *websocket.Conn, code int) {
 	t.Helper()
 	_, _, errRead := readTunnelTestMessage(conn)
@@ -308,6 +330,7 @@ func TestHubBudget_ExhaustedTenantDoesNotStarveAnotherTenant(t *testing.T) {
 	t.Cleanup(srv.Close)
 	t.Cleanup(hub.Close)
 	serverB := dialRole(t, srv.URL, "b", RoleServer, "s", "Server")
+	waitForTunnelPeer(t, hub, "b", "s")
 	clientB := dialRole(t, srv.URL, "b", RoleClient, "c", "Client")
 	_ = readTextJSONFrame(t, clientB)
 
@@ -436,7 +459,7 @@ func TestHubLimits_BinaryPayloadAndTransportBoundaries(t *testing.T) {
 	t.Cleanup(hub.Close)
 	server := dialRole(t, srv.URL, "key", RoleServer, "s", "Server")
 	client := dialRole(t, srv.URL, "key", RoleClient, "c", "Client")
-	_ = readTextJSONFrame(t, client)
+	waitServersVisible(t, client, "s")
 	for _, size := range []int{MaxRawPayloadBytes, MaxRawPayloadBytes + 1, MaxInboundFrameBytes - 6, MaxInboundFrameBytes - 5} {
 		raw := append([]byte{ProtocolVersion1, PayloadTypeBinary, 1, 1, 'c', 's'}, make([]byte, size)...)
 		written := make(chan error, 1)
