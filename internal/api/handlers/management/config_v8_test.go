@@ -116,6 +116,41 @@ func TestConfigV8MigrationAndLegacyAPI(t *testing.T) {
 	}
 }
 
+func TestConfigV8YAMLUploadKeepsRuntimeAuthProjection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	raw := "config-version: 8\noauth: {auth-dir: /vault}\n"
+	if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.AuthDir, cfg.RuntimeAuthDir = "/active", "/active"
+	h := &Handler{cfg: cfg, configFilePath: path}
+	reloads := make(chan *config.Config, 1)
+	h.SetConfigReloadHook(func(_ context.Context, next *config.Config) { reloads <- next })
+	router := gin.New()
+	router.PUT("/v8/management/config.yaml", h.ConfigV8)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPut, "/v8/management/config.yaml", strings.NewReader(raw)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("PUT status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	saved, err := config.LoadConfig(path)
+	if err != nil || saved.AuthDir != "/vault" || h.configSnapshot().AuthDir != "/active" {
+		t.Fatalf("PUT changed the persisted or runtime auth directory: err=%v", err)
+	}
+	select {
+	case next := <-reloads:
+		if next.AuthDir != "/active" || next.RuntimeAuthDir != "/active" {
+			t.Fatal("reload escaped the runtime auth projection")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("missing configuration reload")
+	}
+}
+
 func TestConfigV8CommentsUnknownLegacySectionsOnWrite(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	path := filepath.Join(t.TempDir(), "config.yaml")
