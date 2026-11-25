@@ -86,6 +86,8 @@ func TestHomeExecutorReadinessDuringReplacement(t *testing.T) {
 			waitHomeLifecycle(t, quiescing, "quiesce RPC")
 			checkReadiness("quiescing", false)
 			auth := homeExecutorTestAuth("selected-token", "existing-project", time.Now().Add(time.Hour))
+			// Keep asynchronous usage separate from the dispatch rejection test.
+			auth.ID += "-readiness"
 			req := coreexecutor.Request{Model: homePluginModel, Payload: []byte(`{}`)}
 			_, errExecute := old.Execute(t.Context(), &auth, req, coreexecutor.Options{})
 			assertHomeExecutorUnavailable(t, errExecute)
