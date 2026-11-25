@@ -198,6 +198,21 @@ func TestApplyPatchActualProviderErrorAndEOF(t *testing.T) {
 					if errExecuteStream != nil {
 						t.Fatal(errExecuteStream)
 					}
+					if provider == "antigravity" && mode == "empty" {
+						// With no upstream JSON, Antigravity can retry before the tool bridge sees a frame.
+						var count int
+						for chunk := range stream.Chunks {
+							count++
+							status, ok := chunk.Err.(statusErr)
+							if len(chunk.Payload) != 0 || !ok || status.StatusCode() != http.StatusBadGateway || status.ErrorCode() != cliproxyauth.ErrorCodeTransientTransport {
+								t.Errorf("empty stream chunk = %q, %v; want transient 502 with no payload", chunk.Payload, chunk.Err)
+							}
+						}
+						if count != 1 {
+							t.Errorf("empty stream chunks = %d, want 1", count)
+						}
+						return
+					}
 					assertTask6FailedStream(t, stream.Chunks)
 				}
 			})

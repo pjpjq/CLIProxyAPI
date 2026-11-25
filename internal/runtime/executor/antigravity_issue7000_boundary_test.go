@@ -72,9 +72,13 @@ func TestIssue7000AntigravityAliasesPreserveOtherFieldsAndToolChoice(t *testing.
 					}
 					request := ojson.GetBytes(encoded, "request")
 					assertIssue7000PromptSchema(t, request.Get(systemKey), issue7000LiteralSchema)
+					systemText := request.Get(systemKey + ".parts.0.text").String()
+					if original, _, _ := strings.Cut(systemText, "\n\n"); original != "keep system" {
+						t.Errorf("original system instruction = %q, want %q", original, "keep system")
+					}
 					for path, want := range map[string]string{
 						"generationConfig.temperature": "0.25", "generation_config.stopSequences.0": "STOP",
-						systemKey + ".parts.0.text": "keep system", "contents.0.parts.0.text": "keep history",
+						"contents.0.parts.0.text":             "keep history",
 						"tools.0.functionDeclarations.0.name": "lookup",
 					} {
 						if got := request.Get(path).String(); got != want {
