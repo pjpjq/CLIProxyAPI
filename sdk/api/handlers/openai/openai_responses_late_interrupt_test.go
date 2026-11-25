@@ -143,6 +143,7 @@ func TestResponsesLateInterruptDoesNotPoisonNextCreate(t *testing.T) {
 	send(fmt.Sprintf(`{"type":"response.create","model":%q,"input":[]}`, model))
 	expect("response.created", "r1")
 	expect("response.completed", "r1")
+	time.Sleep(100 * time.Millisecond)
 	send(`{"type":"response.interrupt","response_id":"unknown"}`)
 	expect("error", "")
 	send(`{"type":"response.interrupt","response_id":"r1","mode":"discard_partial_items"}`)

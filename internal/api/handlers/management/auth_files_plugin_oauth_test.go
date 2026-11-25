@@ -18,6 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
@@ -84,6 +85,55 @@ func TestSavePluginLoginRecordsRollsBackSavedAuthsOnFailure(t *testing.T) {
 	}
 	if !store.deleted["geminicli.json"] || !store.deleted["geminicli-project-a.json"] {
 		t.Fatalf("deleted = %#v, want both saved auths rolled back", store.deleted)
+	}
+}
+
+func TestSavePluginLoginRecordsRestoresInactiveVaultRecordOnFailure(t *testing.T) {
+	vault, active := t.TempDir(), t.TempDir()
+	store := sdkAuth.NewPooledFileTokenStore(active, vault)
+	manager := coreauth.NewManager(store, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: active, RuntimeAuthDir: active}, manager)
+	h.tokenStore = store
+
+	const name = "geminicli-existing.json"
+	vaultPath, activePath := filepath.Join(vault, name), filepath.Join(active, name)
+	before := `{"type":"gemini-cli","access_token":"old","disabled":true,"priority":23}`
+	if err := os.WriteFile(vaultPath, []byte(before), 0600); err != nil {
+		t.Fatal(err)
+	}
+	failed := errors.New("injected second credential failure")
+	h.postAuthHook = func(_ context.Context, record *coreauth.Auth) error {
+		if record.FileName == name {
+			return nil
+		}
+		raw, err := os.ReadFile(vaultPath)
+		var saved map[string]any
+		if err != nil || json.Unmarshal(raw, &saved) != nil {
+			t.Fatalf("first refresh missing before injected failure: %v", err)
+		}
+		if saved["access_token"] != "new" || saved["disabled"] != true || saved["priority"] != float64(23) {
+			t.Errorf("re-login lost inactive credential's user metadata: %#v", saved)
+		}
+		if _, err := os.Stat(activePath); err != nil {
+			t.Fatal(err)
+		}
+		return failed
+	}
+	records := []*coreauth.Auth{
+		{ID: name, FileName: name, Provider: "gemini-cli", Metadata: map[string]any{"type": "gemini-cli", "access_token": "new"}},
+		{ID: "geminicli-new.json", FileName: "geminicli-new.json", Provider: "gemini-cli", Metadata: map[string]any{"type": "gemini-cli"}},
+	}
+	if err := h.savePluginLoginRecords(context.Background(), records); !errors.Is(err, failed) {
+		t.Fatalf("batch failure = %v", err)
+	}
+	if raw, err := os.ReadFile(vaultPath); err != nil || string(raw) != before {
+		t.Fatalf("existing vault record was not restored: err=%v", err)
+	}
+	if _, err := os.Lstat(activePath); !os.IsNotExist(err) {
+		t.Fatalf("inactive record remained in the projection: %v", err)
+	}
+	if _, ok := manager.GetByID(name); ok {
+		t.Fatal("inactive record remained registered in memory")
 	}
 }
 
