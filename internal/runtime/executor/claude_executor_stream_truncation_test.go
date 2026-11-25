@@ -40,6 +40,7 @@ func TestClaudeExecutorStreamTruncationReportsError(t *testing.T) {
 	pluginName := "test-claude-passthrough-truncation"
 	plugin := &captureClaudeUsagePlugin{
 		records: make(chan usage.Record, 4),
+		baseURL: server.URL,
 	}
 	usage.RegisterNamedPlugin(pluginName, plugin)
 	t.Cleanup(func() {
@@ -116,6 +117,7 @@ func TestClaudeExecutorTranslatedStreamTruncationReportsError(t *testing.T) {
 	pluginName := "test-claude-translated-truncation"
 	plugin := &captureClaudeUsagePlugin{
 		records: make(chan usage.Record, 4),
+		baseURL: server.URL,
 	}
 	usage.RegisterNamedPlugin(pluginName, plugin)
 	t.Cleanup(func() {
@@ -428,6 +430,7 @@ func TestClaudeExecutorStreamErrorEventDoesNotCommitContinuityAndMarksFailed(t *
 	pluginName := "test-claude-error-event-usage"
 	plugin := &captureClaudeUsagePlugin{
 		records: make(chan usage.Record, 4),
+		baseURL: server.URL,
 	}
 	usage.RegisterNamedPlugin(pluginName, plugin)
 	t.Cleanup(func() {
