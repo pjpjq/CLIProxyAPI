@@ -376,6 +376,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 		}
 		internalProviderKey := util.OpenAICompatibleProviderKey(providerName)
 		base := strings.TrimSpace(compat.BaseURL)
+		wireAPI := strings.ToLower(strings.TrimSpace(compat.WireAPI))
 		disableCooling := compat.DisableCooling
 
 		// Handle new APIKeyEntries format (preferred)
@@ -406,6 +407,9 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			addRequestScopedErrorsToMetadata(compat.RequestScopedErrors, metadata)
 			if compat.Priority != 0 {
 				attrs["priority"] = strconv.Itoa(compat.Priority)
+			}
+			if wireAPI != "" {
+				attrs["wire_api"] = wireAPI
 			}
 			addWeightToAttrs(entry.Weight, attrs)
 			if key != "" {
@@ -458,6 +462,9 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			addRequestScopedErrorsToMetadata(compat.RequestScopedErrors, metadata)
 			if compat.Priority != 0 {
 				attrs["priority"] = strconv.Itoa(compat.Priority)
+			}
+			if wireAPI != "" {
+				attrs["wire_api"] = wireAPI
 			}
 			if hash := diff.ComputeOpenAICompatModelsHash(compat.Models); hash != "" {
 				attrs["models_hash"] = hash

@@ -241,8 +241,12 @@ func (m *Manager) wrapStreamResultWithCancel(ctx context.Context, auth *Auth, pr
 		if aliasResult.ForceMapping && strings.TrimSpace(aliasResult.OriginalAlias) != "" {
 			rewriter = NewStreamRewriter(StreamRewriteOptions{RewriteModel: aliasResult.OriginalAlias})
 		}
+		isClassifiedBadGateway := func(err error) bool {
+			return err != nil && statusCodeFromError(err) == http.StatusBadGateway && errorCodeFromError(err) == transientTransportErrorCode
+		}
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
 			if chunk.Err != nil && !failed {
+				resultCtx := ctx
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					if retryAfterFromError(chunk.Err) != nil {
 						m.recordCanceledUpstreamCooldown(ctx, auth, provider, resultModel, routeModel, opts, chunk.Err, ephemeralResult, executionSeq)
@@ -250,8 +254,12 @@ func (m *Manager) wrapStreamResultWithCancel(ctx context.Context, auth *Auth, pr
 						return false
 					}
 					if !isRequestScopedError(chunk.Err) {
-						failed = true
-						return false
+						// A classified upstream 502 may arrive after its SSE error caused cancellation.
+						if !isClassifiedBadGateway(chunk.Err) {
+							failed = true
+							return false
+						}
+						resultCtx = context.WithoutCancel(ctx)
 					}
 				}
 				failed = true
@@ -263,7 +271,7 @@ func (m *Manager) wrapStreamResultWithCancel(ctx context.Context, auth *Auth, pr
 				result.RetryAfter = retryAfterFromError(chunk.Err)
 				result.CredentialScope = isCredentialScopedError(chunk.Err)
 				applyRequestScopedActionToResult(action, okAction, &result)
-				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
+				m.recordExecutionResult(resultCtx, result, auth, ephemeralResult)
 				if okAction && !isRequestTerminatedError(chunk.Err) && !isRequestStopError(chunk.Err) && !isTOSViolationError(chunk.Err) {
 					if isRequestScopedStop(action, okAction) {
 						chunk.Err = wrapRequestStopError(chunk.Err)
@@ -329,15 +337,30 @@ func (m *Manager) wrapStreamResultWithCancel(ctx context.Context, auth *Auth, pr
 				return true
 			}
 		}
+		stop := func() {
+			if cancelAttempt != nil {
+				cancelAttempt()
+			}
+			if remaining == nil || failed || ctx == nil || ctx.Err() == nil {
+				discardStreamChunks(remaining)
+				return
+			}
+			// Finish error accounting without keeping the canceled client stream open.
+			forward = false
+			go func() {
+				for chunk := range remaining {
+					if !failed && isClassifiedBadGateway(chunk.Err) {
+						emit(chunk)
+					}
+				}
+			}()
+		}
 		for _, chunk := range buffered {
 			if !forward {
 				break
 			}
 			if ok := emit(chunk); !ok {
-				if cancelAttempt != nil {
-					cancelAttempt()
-				}
-				discardStreamChunks(remaining)
+				stop()
 				return
 			}
 		}
@@ -354,10 +377,7 @@ func (m *Manager) wrapStreamResultWithCancel(ctx context.Context, auth *Auth, pr
 				default:
 					select {
 					case <-ctx.Done():
-						if cancelAttempt != nil {
-							cancelAttempt()
-						}
-						discardStreamChunks(remaining)
+						stop()
 						return
 					case chunk, open = <-remaining:
 					}
@@ -372,10 +392,7 @@ func (m *Manager) wrapStreamResultWithCancel(ctx context.Context, auth *Auth, pr
 				continue
 			}
 			if ok := emit(chunk); !ok {
-				if cancelAttempt != nil {
-					cancelAttempt()
-				}
-				discardStreamChunks(remaining)
+				stop()
 				return
 			}
 		}
