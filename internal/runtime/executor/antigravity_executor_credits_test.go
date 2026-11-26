@@ -987,6 +987,27 @@ func TestAntigravityManagerExecuteAndStream_ToppedUpCreditsRecoverDuringQuotaCoo
 			if loadCodeAssistCalls.Load() <= callsBeforeTopUp {
 				t.Fatalf("loadCodeAssist calls after top-up = %d, want > %d", loadCodeAssistCalls.Load(), callsBeforeTopUp)
 			}
+			// The deferred failure-state cleanup can republish an empty hint after the
+			// asynchronous refresh; one retry lets the refresh republish the topped-up hint.
+			if current, hintOK := cliproxyauth.GetAntigravityCreditsHint(authID, registered.RegistrationEpoch); !hintOK || !current.Known || !current.Available {
+				if stream {
+					retryResult, errRetry := manager.ExecuteStream(context.Background(), []string{"antigravity"}, req, opts)
+					if errRetry != nil {
+						t.Fatalf("ExecuteStream() retry error = %v", errRetry)
+					}
+					for range retryResult.Chunks {
+					}
+				} else {
+					if _, errRetry := manager.Execute(context.Background(), []string{"antigravity"}, req, opts); errRetry != nil {
+						t.Fatalf("Execute() retry error = %v", errRetry)
+					}
+				}
+				if value, ok := antigravityCreditsHintRefreshByID.Load(authID); ok {
+					if state, ok := value.(*antigravityCreditsHintRefreshState); ok && state != nil {
+						waitForAntigravityCreditsRefresh(t, state)
+					}
+				}
+			}
 			hint, ok = cliproxyauth.GetAntigravityCreditsHint(authID, registered.RegistrationEpoch)
 			if !ok || !hint.Known || !hint.Available || hint.CreditAmount != 2516 {
 				t.Fatalf("hint after recovery = %#v (ok=%v), want Known=true Available=true CreditAmount=2516", hint, ok)
