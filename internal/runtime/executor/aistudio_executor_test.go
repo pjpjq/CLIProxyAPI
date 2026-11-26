@@ -236,6 +236,7 @@ func TestAIStudioExecutorWithoutRelaySessionDoesNotMarkUpstreamAttempt(t *testin
 
 func TestAIStudioExecutorExecuteStartsTTFTBeforeRelayWait(t *testing.T) {
 	const authID = "aistudio-ttft-auth"
+	const model = "gemini-3.1-pro-preview"
 	delay := 40 * time.Millisecond
 	connected := make(chan struct{})
 	var connectedOnce sync.Once
@@ -304,11 +305,13 @@ func TestAIStudioExecutorExecuteStartsTTFTBeforeRelayWait(t *testing.T) {
 	}()
 
 	plugin := &captureAIStudioUsagePlugin{records: make(chan usage.Record, 16)}
+	// A prior same-model attempt may arrive from the shared async usage queue.
+	plugin.records <- usage.Record{Provider: "aistudio", Model: model, AuthID: "aistudio-not-connected"}
 	usage.RegisterPlugin(plugin)
 	exec := NewAIStudioExecutor(&config.Config{}, "aistudio", relay)
 	ctx := cliproxyexecutor.WithUpstreamAttemptTracker(context.Background())
 	_, errExecute := exec.Execute(ctx, &cliproxyauth.Auth{ID: authID, Provider: "aistudio"}, cliproxyexecutor.Request{
-		Model:   "gemini-3.1-pro-preview",
+		Model:   model,
 		Payload: []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`),
 	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatGemini})
 	if errExecute != nil {
@@ -321,7 +324,7 @@ func TestAIStudioExecutorExecuteStartsTTFTBeforeRelayWait(t *testing.T) {
 		t.Fatal(errClient)
 	}
 
-	record := waitForAIStudioUsageRecord(t, plugin.records, "gemini-3.1-pro-preview")
+	record := waitForAIStudioUsageRecord(t, plugin.records, model, authID)
 	if record.TTFT < delay {
 		t.Fatalf("ttft = %v, want >= %v", record.TTFT, delay)
 	}
@@ -341,13 +344,13 @@ func (p *captureAIStudioUsagePlugin) HandleUsage(_ context.Context, record usage
 	}
 }
 
-func waitForAIStudioUsageRecord(t *testing.T, records <-chan usage.Record, model string) usage.Record {
+func waitForAIStudioUsageRecord(t *testing.T, records <-chan usage.Record, model, authID string) usage.Record {
 	t.Helper()
 	timeout := time.After(2 * time.Second)
 	for {
 		select {
 		case record := <-records:
-			if record.Provider == "aistudio" && record.Model == model {
+			if record.Provider == "aistudio" && record.Model == model && record.AuthID == authID {
 				return record
 			}
 		case <-timeout:

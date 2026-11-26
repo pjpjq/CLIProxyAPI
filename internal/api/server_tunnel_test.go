@@ -366,9 +366,13 @@ func TestServerWebsocketTunnel_HotReloadRevokesRemovedKeyOnly(t *testing.T) {
 	httpSrv := httptest.NewServer(apiSrv.Handler())
 	t.Cleanup(httpSrv.Close)
 
-	srvKeep := dialServerTunnel(t, httpSrv.URL, "key-keep", wstunnel.RoleServer, "s-keep", "Keep Server")
 	cliKeep := dialServerTunnel(t, httpSrv.URL, "key-keep", wstunnel.RoleClient, "c-keep", "Keep Client")
 	_ = readServerTunnelJSON(t, cliKeep)
+	srvKeep := dialServerTunnel(t, httpSrv.URL, "key-keep", wstunnel.RoleServer, "s-keep", "Keep Server")
+	online := readServerTunnelJSON(t, cliKeep)
+	if online.Get("type").String() != wstunnel.ControlTypeServerOnline || online.Get("server.uuid").String() != "s-keep" {
+		t.Fatalf("unexpected server_online event: %s", online.Raw)
+	}
 
 	cliRevoke := dialServerTunnel(t, httpSrv.URL, "key-revoke", wstunnel.RoleClient, "c-revoke", "Revoke Client")
 	_ = readServerTunnelJSON(t, cliRevoke)
