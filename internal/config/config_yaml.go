@@ -62,6 +62,16 @@ func renderConfigSave(data []byte, persistCfg *Config, migrating bool) ([]byte, 
 		originalSecrets, _, _ = inspectConfigSecrets(docs)
 	}
 	original.Content[0] = flat
+	if persistCfg != nil && persistCfg.RuntimeAuthDir != "" {
+		cfgCopy := *persistCfg
+		cfgCopy.AuthDir = ""
+		if authDir := copyYAMLPathValue(flat, "auth-dir"); authDir != nil {
+			if err := authDir.Decode(&cfgCopy.AuthDir); err != nil {
+				return nil, nil, nil, err
+			}
+		}
+		persistCfg = &cfgCopy
+	}
 
 	// Marshal the current cfg to YAML, then unmarshal to a yaml.Node we can merge from.
 	rendered, err := yaml.Marshal((*legacyConfig)(persistCfg))

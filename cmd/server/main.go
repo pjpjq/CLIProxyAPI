@@ -140,6 +140,8 @@ func run() (exitStatus int) {
 	var vertexImportPrefix string
 	var siwcBind string
 	var configPath string
+	var activeAuthDir string
+	var authVaultDir string
 	var password string
 	var homeJWT string
 	var homeDisableClusterDiscovery bool
@@ -169,6 +171,8 @@ func run() (exitStatus int) {
 	flag.Func("discover-include", "Comma-separated interface names to scan during LAN discovery", appendCSV(&discoverInclude))
 	flag.Func("discover-exclude", "Comma-separated interface names to skip during LAN discovery", appendCSV(&discoverExclude))
 	flag.StringVar(&configPath, "config", DefaultConfigPath, "Configure File Path")
+	flag.StringVar(&activeAuthDir, "runtime-auth-dir", "", "Local projection directory for file-backed credentials")
+	flag.StringVar(&authVaultDir, "auth-vault-dir", "", "Authoritative credential directory for -runtime-auth-dir")
 	flag.StringVar(&vertexImport, "vertex-import", "", "Import Vertex service account key JSON file")
 	flag.StringVar(&vertexImportPrefix, "vertex-import-prefix", "", "Prefix for Vertex model namespacing (use with -vertex-import)")
 	flag.StringVar(&siwcBind, "siwc-bind", "", "Bind Sign in with ChatGPT (SIWC) credentials to a Codex credential file")
@@ -617,6 +621,23 @@ func run() (exitStatus int) {
 	} else {
 		cfg.AuthDir = resolvedAuthDir
 	}
+	if activeAuthDir != "" || authVaultDir != "" {
+		if !filepath.IsAbs(activeAuthDir) || !filepath.IsAbs(authVaultDir) ||
+			filepath.Clean(activeAuthDir) == filepath.Clean(authVaultDir) ||
+			usePostgresStore || useObjectStore || useGitStore {
+			logStartupErrorf("file credential pool requires distinct absolute runtime and vault directories and the file store")
+			return 1
+		}
+		var errActive, errVault error
+		activeAuthDir, errActive = filepath.EvalSymlinks(activeAuthDir)
+		authVaultDir, errVault = filepath.EvalSymlinks(authVaultDir)
+		if errActive != nil || errVault != nil || activeAuthDir == authVaultDir {
+			logStartupErrorf("file credential pool directories are unavailable or refer to the same location")
+			return 1
+		}
+		cfg.RuntimeAuthDir = activeAuthDir
+		cfg.AuthDir = cfg.RuntimeAuthDir
+	}
 	githubauth.SetToken(cfg.GitHubToken)
 	managementasset.SetCurrentConfig(cfg)
 
@@ -646,7 +667,11 @@ func run() (exitStatus int) {
 	} else if useGitStore {
 		sdkAuth.RegisterTokenStore(gitStoreInst)
 	} else {
-		sdkAuth.RegisterTokenStore(sdkAuth.NewFileTokenStore())
+		if authVaultDir != "" {
+			sdkAuth.RegisterTokenStore(sdkAuth.NewPooledFileTokenStore(cfg.AuthDir, filepath.Clean(authVaultDir)))
+		} else {
+			sdkAuth.RegisterTokenStore(sdkAuth.NewFileTokenStore())
+		}
 	}
 
 	// Register built-in access providers before constructing services.
