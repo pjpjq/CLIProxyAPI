@@ -114,6 +114,9 @@ func (w *Watcher) reloadConfig() bool {
 
 	w.authRescanMu.Lock()
 	w.clientsMutex.Lock()
+	if w.config != nil && w.config.RuntimeAuthDir != "" {
+		newConfig.RuntimeAuthDir = w.config.RuntimeAuthDir
+	}
 	var oldConfig *config.Config
 	_ = yaml.Unmarshal(w.oldConfigYaml, &oldConfig)
 	prevAuthDir := w.authDir

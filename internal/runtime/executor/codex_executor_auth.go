@@ -133,6 +133,11 @@ func resolveCodexAuthDiskPath(cfg *config.Config, auth *cliproxyauth.Auth) (stri
 		}
 	}
 	for _, candidate := range candidates {
+		if cfg != nil && cfg.RuntimeAuthDir != "" {
+			if store, ok := sdkauth.GetTokenStore().(*sdkauth.FileTokenStore); ok {
+				candidate = store.AuthoritativeAuthPath(candidate)
+			}
+		}
 		info, errStat := os.Stat(candidate)
 		if errStat != nil {
 			if os.IsNotExist(errStat) {
@@ -171,17 +176,36 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	}
 	if diskPath != "" {
 		var outAuth *cliproxyauth.Auth
-		errLock := codexauth.WithFileLock(diskPath, func() error {
+		pooled := cfg != nil && cfg.RuntimeAuthDir != ""
+		refreshLockPath := diskPath
+		if pooled {
+			// Serialize refresh and publication together without holding the pool
+			// or vault write lock across the upstream OAuth request.
+			refreshLockPath = filepath.Join(cfg.RuntimeAuthDir, filepath.Base(diskPath)+".refresh")
+		}
+		errLock := codexauth.WithFileLock(refreshLockPath, func() error {
 			var errInner error
-			outAuth, errInner = e.refreshLocked(ctx, auth, diskPath, homeEnabled)
-			return errInner
+			outAuth, errInner = e.refreshLocked(ctx, auth, diskPath, homeEnabled, !pooled)
+			if !pooled || errInner != nil || outAuth == nil || outAuth.CodexRefreshPatch == nil {
+				return errInner
+			}
+			persisted := outAuth.Clone()
+			saved, errSave := sdkauth.GetTokenStore().Save(ctx, persisted)
+			if errSave != nil {
+				return errSave
+			}
+			if saved == "" {
+				return fmt.Errorf("codex executor: credential was removed during refresh")
+			}
+			outAuth.Metadata = persisted.Metadata
+			return nil
 		})
 		return outAuth, errLock
 	}
-	return e.refreshLocked(ctx, auth, "", homeEnabled)
+	return e.refreshLocked(ctx, auth, "", homeEnabled, false)
 }
 
-func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Auth, diskPath string, homeEnabled bool) (*cliproxyauth.Auth, error) {
+func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Auth, diskPath string, homeEnabled, persistDisk bool) (*cliproxyauth.Auth, error) {
 	var cfg *config.Config
 	if e != nil {
 		cfg = e.cfg
@@ -501,7 +525,7 @@ func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Au
 		clonedStorage.RefreshPatch = patch
 		auth.Storage = &clonedStorage
 	}
-	if diskPath != "" {
+	if persistDisk {
 		latestBytes, errReadLatest := os.ReadFile(diskPath)
 		if errReadLatest != nil {
 			return auth, fmt.Errorf("codex executor: re-read credential file %s before write: %w", diskPath, errReadLatest)

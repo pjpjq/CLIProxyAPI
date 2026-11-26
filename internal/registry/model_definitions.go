@@ -528,7 +528,7 @@ func GetMetaModels() []*ModelInfo {
 // LookupStaticModelInfo searches all static model definitions for a model by ID.
 // Returns nil if no matching model is found.
 func LookupStaticModelInfo(modelID string) *ModelInfo {
-	return lookupStaticModelInfo(modelID, devinModelDefinitions())
+	return lookupStaticModelInfo(modelID, WithDevinBuiltins(devinModelDefinitions()))
 }
 
 func lookupStaticModelInfo(modelID string, additionalCatalog []*ModelInfo) *ModelInfo {

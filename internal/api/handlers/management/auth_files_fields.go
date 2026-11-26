@@ -163,7 +163,9 @@ func (h *Handler) patchPluginVirtualSourceStatus(ctx context.Context, targetAuth
 	if sourcePath == "" {
 		return nil, errPluginVirtualAuth
 	}
-	if errWrite := setSourceAuthFileDisabled(sourcePath, disabled); errWrite != nil {
+	if errWrite := h.writeManagedAuthFile(sourcePath, false, func(path string) error {
+		return setSourceAuthFileDisabled(path, disabled)
+	}); errWrite != nil {
 		if os.IsNotExist(errWrite) {
 			return nil, errAuthFileNotFound
 		}
@@ -925,6 +927,15 @@ func cleanAuthFilePath(path string) string {
 	return filepath.Clean(path)
 }
 
+func (h *Handler) writeManagedAuthFile(path string, create bool, write func(string) error) error {
+	if store, ok := h.tokenStoreWithBaseDir().(interface {
+		WriteManagedAuthFile(string, bool, func(string) error) error
+	}); ok {
+		return store.WriteManagedAuthFile(path, create, write)
+	}
+	return write(path)
+}
+
 func (h *Handler) deleteTokenRecord(ctx context.Context, path string) error {
 	if strings.TrimSpace(path) == "" {
 		return fmt.Errorf("auth path is empty")
@@ -974,6 +985,9 @@ func (h *Handler) mergeExistingAuthFileMetadata(record *coreauth.Auth) {
 			}
 		}
 		if fullPath != "" {
+			if store, ok := h.tokenStoreWithBaseDir().(*sdkAuth.FileTokenStore); ok {
+				fullPath = store.AuthoritativeAuthPath(fullPath)
+			}
 			if raw, errRead := os.ReadFile(fullPath); errRead == nil && len(raw) > 0 {
 				_ = json.Unmarshal(raw, &existingMap)
 			}
@@ -1134,6 +1148,10 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 			return savedPath, fmt.Errorf("post-auth persist hook failed: %w", errHook)
 		}
 	} else if h.authManager != nil && strings.TrimSpace(savedPath) != "" {
+		if files, ok := store.(*sdkAuth.FileTokenStore); ok && files.AuthoritativeAuthPath(savedPath) != savedPath {
+			// The file is already durable; registration must not produce a second vault write.
+			ctx = coreauth.WithSkipPersist(ctx)
+		}
 		if errReg := h.registerAuthFromFileWithID(ctx, savedPath, nil, record.ID); errReg != nil {
 			return savedPath, fmt.Errorf("register persisted auth failed: %w", errReg)
 		}

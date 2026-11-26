@@ -42,12 +42,13 @@ func (m *Manager) BindCodexSIWC(ctx context.Context, id string, expectedEpoch ui
 	}
 	var committed *Auth
 	cooldownChanged := false
-	err = codex.WithFileLock(path, func() error {
+	activePath := path
+	write := func() error {
 		if errCtx := ctx.Err(); errCtx != nil {
 			return errCtx
 		}
 		checkedPath, errPath := m.codexBindingPath(base)
-		if errPath != nil || checkedPath != path {
+		if errPath != nil || checkedPath != activePath {
 			return fmt.Errorf("bind SIWC: backing file changed")
 		}
 		info, errStat := os.Lstat(path)
@@ -163,7 +164,18 @@ func (m *Manager) BindCodexSIWC(ctx context.Context, id string, expectedEpoch ui
 		committed = updated.Clone()
 		m.mu.Unlock()
 		return nil
-	})
+	}
+	lockAndWrite := func(vaultPath string) error {
+		path = vaultPath
+		return codex.WithFileLock(path, write)
+	}
+	if store, ok := m.store.(interface {
+		WriteManagedAuthFile(string, bool, func(string) error) error
+	}); ok {
+		err = store.WriteManagedAuthFile(activePath, false, lockAndWrite)
+	} else {
+		err = lockAndWrite(activePath)
+	}
 	if err != nil {
 		return nil, err
 	}
