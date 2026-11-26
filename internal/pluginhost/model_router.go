@@ -41,7 +41,11 @@ func (h *Host) RouteModelExcept(ctx context.Context, req pluginapi.ModelRouteReq
 		if router == nil || h.isPluginFused(record.id) || record.id == skipPluginID {
 			continue
 		}
-		nextReq := cloneModelRouteRequest(req)
+		nextReq := req
+		// RPC serialization already isolates plugin input; native routers still need a defensive copy.
+		if _, rpc := router.(*rpcPluginAdapter); !rpc {
+			nextReq = cloneModelRouteRequest(req)
+		}
 		nextReq.Plugin = clonePluginMetadata(record.meta)
 		nextReq.PluginID = record.id
 		resp, ok := h.callModelRouter(ctx, record.id, router, nextReq)

@@ -307,7 +307,9 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	}
 	release := h.beginSIWCFileMutation(ctx, dst)
 	defer release()
-	if errWrite := h.writeAuthFileBytes(dst, data, auth); errWrite != nil {
+	if errWrite := h.writeManagedAuthFile(dst, true, func(path string) error {
+		return h.writeAuthFileBytes(path, data, auth)
+	}); errWrite != nil {
 		return fmt.Errorf("failed to write file: %w", errWrite)
 	}
 	if err := h.upsertAuthRecord(ctx, auth); err != nil {
@@ -342,7 +344,9 @@ func (h *Handler) writeAuthFileV8(ctx context.Context, name string, data []byte)
 	release := h.beginSIWCFileMutation(ctx, dst)
 	defer release()
 
-	if errWrite := h.writeAuthFileBytesV8(dst, data, needCodexLock); errWrite != nil {
+	if errWrite := h.writeManagedAuthFile(dst, true, func(path string) error {
+		return h.writeAuthFileBytesV8(path, data, needCodexLock)
+	}); errWrite != nil {
 		return fmt.Errorf("failed to write file: %w", errWrite)
 	}
 	if errReconcile := h.reconcileV8UploadedAuths(ctx, dst, auths); errReconcile != nil {

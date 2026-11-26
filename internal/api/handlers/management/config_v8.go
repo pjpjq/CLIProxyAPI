@@ -262,6 +262,10 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 	prevSecretHash := ""
 	if h.cfg != nil {
 		next.Home = h.cfg.Home
+		if h.cfg.RuntimeAuthDir != "" {
+			next.RuntimeAuthDir = h.cfg.RuntimeAuthDir
+			next.AuthDir = next.RuntimeAuthDir
+		}
 		prevSecretHash = h.cfg.RemoteManagement.SecretKey
 	}
 	next.SourceHash = saved.SourceHash()

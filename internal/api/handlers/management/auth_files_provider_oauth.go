@@ -1774,6 +1774,7 @@ type savedPluginRecordRollback struct {
 	hadFileDerivedAuth bool
 	prevAuth           *coreauth.Auth
 	record             *coreauth.Auth
+	poolSave           *sdkAuth.PooledFileSave
 }
 
 func (h *Handler) candidatePluginRecordPath(record *coreauth.Auth) string {
@@ -1807,7 +1808,13 @@ func (h *Handler) savePluginLoginRecords(ctx context.Context, records []*coreaut
 	for _, record := range records {
 		var rb savedPluginRecordRollback
 		candidatePath := h.candidatePluginRecordPath(record)
-		if candidatePath != "" {
+		ctxSave := ctx
+		if h != nil {
+			if store, ok := h.tokenStoreWithBaseDir().(*sdkAuth.FileTokenStore); ok {
+				ctxSave, rb.poolSave = store.ObservePooledFileSave(ctx)
+			}
+		}
+		if candidatePath != "" && rb.poolSave == nil {
 			prevBytes, errRead := os.ReadFile(candidatePath)
 			if errRead == nil {
 				rb.existedOnDisk = true
@@ -1839,7 +1846,7 @@ func (h *Handler) savePluginLoginRecords(ctx context.Context, records []*coreaut
 				}
 			}
 		}
-		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		savedPath, errSave := h.saveTokenRecord(ctxSave, record)
 		rb.savedPath = strings.TrimSpace(savedPath)
 		rb.diskPath = firstNonEmpty(rb.savedPath, candidatePath)
 		rb.record = record
@@ -1848,7 +1855,10 @@ func (h *Handler) savePluginLoginRecords(ctx context.Context, records []*coreaut
 				rb.savedDiskBytes = rawer.RawJSON()
 			}
 		}
-		if rb.savedPath != "" || rb.existedOnDisk || rb.hadRuntimeAuth {
+		if !rb.poolSave.Captured() {
+			rb.poolSave = nil
+		}
+		if rb.savedPath != "" || rb.existedOnDisk || rb.hadRuntimeAuth || rb.poolSave != nil {
 			rollbacks = append(rollbacks, rb)
 		}
 		if errSave != nil {
@@ -1871,6 +1881,14 @@ func jsonPayloadsEqualOrBytesEqual(left, right []byte) bool {
 }
 
 var errPluginRollbackSuperseded = errors.New("plugin login rollback superseded")
+
+func restorePooledPluginRecord(rb savedPluginRecordRollback) bool {
+	restored, err := rb.poolSave.Rollback()
+	if err != nil {
+		log.WithError(err).WithField("path", rb.diskPath).Warn("failed to roll back pooled plugin auth token")
+	}
+	return restored && err == nil
+}
 
 func (h *Handler) restoreOverwrittenPluginRecord(ctx context.Context, rb savedPluginRecordRollback, diskPath string) {
 	if diskPath != "" && len(rb.prevDiskBytes) > 0 {
@@ -1968,7 +1986,11 @@ func (h *Handler) rollbackSavedPluginLoginRecords(ctx context.Context, rollbacks
 				if currFP != "" && currFP != authGrantFingerprint(rb.record) && currFP != authGrantFingerprint(rb.prevAuth) {
 					return errPluginRollbackSuperseded
 				}
-				if rb.existedOnDisk && diskPath != "" {
+				if rb.poolSave != nil {
+					if !restorePooledPluginRecord(rb) {
+						return errPluginRollbackSuperseded
+					}
+				} else if rb.existedOnDisk && diskPath != "" {
 					currentBytes, errRead := os.ReadFile(diskPath)
 					if errRead != nil {
 						return errPluginRollbackSuperseded
@@ -2028,7 +2050,12 @@ func (h *Handler) rollbackSavedPluginLoginRecords(ctx context.Context, rollbacks
 						}
 					}
 					if !diskHandled {
-						if rb.existedOnDisk && diskPath != "" {
+						if rb.poolSave != nil {
+							if !restorePooledPluginRecord(rb) {
+								superseded = true
+								return false
+							}
+						} else if rb.existedOnDisk && diskPath != "" {
 							if currentBytes, errRead := os.ReadFile(diskPath); errRead == nil {
 								matchesSaved := len(rb.savedDiskBytes) == 0 || jsonPayloadsEqualOrBytesEqual(currentBytes, rb.savedDiskBytes)
 								if !matchesSaved && !jsonPayloadsEqualOrBytesEqual(currentBytes, rb.prevDiskBytes) {
@@ -2065,7 +2092,9 @@ func (h *Handler) rollbackSavedPluginLoginRecords(ctx context.Context, rollbacks
 		}
 
 		diskSuperseded := false
-		if rb.existedOnDisk && diskPath != "" {
+		if rb.poolSave != nil {
+			diskSuperseded = !restorePooledPluginRecord(rb)
+		} else if rb.existedOnDisk && diskPath != "" {
 			currentBytes, errRead := os.ReadFile(diskPath)
 			if errRead == nil {
 				matchesSaved := len(rb.savedDiskBytes) == 0 || jsonPayloadsEqualOrBytesEqual(currentBytes, rb.savedDiskBytes)

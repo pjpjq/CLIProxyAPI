@@ -66,6 +66,8 @@ type Config struct {
 
 	// AuthDir is the directory where authentication token files are stored.
 	AuthDir string `yaml:"auth-dir" json:"-"`
+	// RuntimeAuthDir pins a file-backed projection without changing the saved AuthDir.
+	RuntimeAuthDir string `yaml:"-" json:"-"`
 
 	// Debug enables or disables debug-level logging and other debug features.
 	Debug bool `yaml:"debug" json:"debug"`
