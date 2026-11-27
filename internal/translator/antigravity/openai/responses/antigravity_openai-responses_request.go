@@ -2,19 +2,19 @@ package responses
 
 import (
 	"context"
-	"encoding/json"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	. "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/antigravity/gemini"
-	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
-	. "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/gemini/openai/responses"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/MoeForge/moego/json"
+	"github.com/MoeForge/moego/ojson"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	sigcompat "github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	. "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/antigravity/gemini"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
+	. "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/gemini/openai/responses"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 const antigravityWebSearchSystemInstruction = "You are a search engine bot. You will be given a query from a user. Your task is to search the web for relevant information that will help the user. You MUST perform a web search. Do not respond or interact with the user, please respond as if they typed the query into a search bar."
@@ -45,35 +45,38 @@ func antigravitySupportsNativeResponsesWebSearch(model string, modelInfo *regist
 }
 
 func shouldBuildAntigravityResponsesWebSearchRequest(model string, payload []byte, modelInfo *registry.ModelInfo) bool {
-	root := gjson.ParseBytes(payload)
+	root := util.ParseGJSONBytesNoCopy(payload)
 	return HasOnlyResponsesWebSearchTools(root) &&
 		antigravitySupportsNativeResponsesWebSearch(model, modelInfo) &&
 		AllowsResponsesWebSearchToolChoice(root)
 }
 
-func buildAntigravityResponsesWebSearchRequest(model string, payload []byte, stream bool) []byte {
-	includedDomains := ExtractResponsesWebSearchAllowedDomains(gjson.ParseBytes(payload))
-	rawJSON := ConvertOpenAIResponsesRequestToGemini(model, payload, stream)
-	rawJSON = rewriteOpenAIResponsesReasoningForAntigravityClaude(model, payload, rawJSON)
-	out := ConvertGeminiRequestToAntigravity(model, rawJSON, stream)
-	out, _ = sjson.SetBytes(out, "requestType", "web_search")
-	out = ensureAntigravityResponsesWebSearchTool(out, includedDomains)
-	out = ensureAntigravityResponsesWebSearchSystemInstruction(out)
-	return enableAntigravityResponsesThinkingSummary(payload, out)
+func buildAntigravityResponsesWebSearchRequest(model string, payload []byte, stream bool) ([]byte, error) {
+	includedDomains := ExtractResponsesWebSearchAllowedDomains(util.ParseGJSONBytesNoCopy(payload))
+	rawJSON, errConvert := ConvertOpenAIResponsesRequestToGemini(model, payload, stream)
+	rawJSON = stripAntigravityServerSideToolInvocations(rawJSON)
+	rawJSON = rewriteOpenAIResponsesReasoningForAntigravityClaude(model, rawJSON)
+	out, _ := ConvertGeminiRequestToAntigravity(model, rawJSON, stream)
+	outDoc := ojson.NewDoc(out)
+	_ = outDoc.Set("requestType", "web_search")
+	ensureAntigravityResponsesWebSearchToolDoc(outDoc, out, includedDomains)
+	ensureAntigravityResponsesWebSearchSystemInstructionDoc(outDoc, out)
+	NormalizeAntigravityRequestDoc(outDoc)
+	return enableAntigravityResponsesThinkingSummary(payload, outDoc.Bytes()), errConvert
 }
 
-func ensureAntigravityResponsesWebSearchTool(payload []byte, includedDomains []string) []byte {
+func ensureAntigravityResponsesWebSearchToolDoc(doc *ojson.Doc, payload []byte, includedDomains []string) {
 	googleSearchTool := []byte(`{"googleSearch":{"enhancedContent":{"imageSearch":{"maxResultCount":5}}}}`)
 	if len(includedDomains) > 0 {
 		if domainsJSON, errMarshal := json.Marshal(includedDomains); errMarshal == nil {
-			googleSearchTool, _ = sjson.SetRawBytes(googleSearchTool, "googleSearch.includedDomains", domainsJSON)
+			googleSearchTool, _ = ojson.SetRawBytes(googleSearchTool, "googleSearch.includedDomains", domainsJSON)
 		}
 	}
 
-	tools := gjson.GetBytes(payload, "request.tools")
+	tools := ojson.GetBytesNoCopy(payload, "request.tools")
 	if !tools.IsArray() {
-		payload, _ = sjson.SetRawBytes(payload, "request.tools", translatorcommon.JoinRawArray([][]byte{googleSearchTool}))
-		return payload
+		_ = doc.SetRawBytes("request.tools", translatorcommon.JoinRawArray([][]byte{googleSearchTool}))
+		return
 	}
 
 	replaced := false
@@ -91,20 +94,19 @@ func ensureAntigravityResponsesWebSearchTool(payload []byte, includedDomains []s
 	if !replaced {
 		filtered = append([][]byte{googleSearchTool}, filtered...)
 	}
-	payload, _ = sjson.SetRawBytes(payload, "request.tools", translatorcommon.JoinRawArray(filtered))
-	return payload
+	_ = doc.SetRawBytes("request.tools", translatorcommon.JoinRawArray(filtered))
 }
 
-func ensureAntigravityResponsesWebSearchSystemInstruction(payload []byte) []byte {
+func ensureAntigravityResponsesWebSearchSystemInstructionDoc(doc *ojson.Doc, payload []byte) {
 	searchPart := []byte(`{"text":""}`)
-	searchPart, _ = sjson.SetBytes(searchPart, "text", antigravityWebSearchSystemInstruction)
+	searchPart, _ = ojson.SetBytes(searchPart, "text", antigravityWebSearchSystemInstruction)
 
-	sys := gjson.GetBytes(payload, "request.systemInstruction")
+	sys := ojson.GetBytesNoCopy(payload, "request.systemInstruction")
 	if !sys.Exists() {
 		instr := []byte(`{"role":"user","parts":[]}`)
-		instr, _ = sjson.SetRawBytes(instr, "parts", translatorcommon.JoinRawArray([][]byte{searchPart}))
-		payload, _ = sjson.SetRawBytes(payload, "request.systemInstruction", instr)
-		return payload
+		instr, _ = ojson.SetRawBytes(instr, "parts", translatorcommon.JoinRawArray([][]byte{searchPart}))
+		_ = doc.SetRawBytes("request.systemInstruction", instr)
+		return
 	}
 
 	var parts [][]byte
@@ -120,33 +122,32 @@ func ensureAntigravityResponsesWebSearchSystemInstruction(payload []byte) []byte
 	if !alreadyPresent {
 		parts = append(parts, searchPart)
 	}
-	payload, _ = sjson.SetRawBytes(payload, "request.systemInstruction.parts", translatorcommon.JoinRawArray(parts))
-	return payload
+	_ = doc.SetRawBytes("request.systemInstruction.parts", translatorcommon.JoinRawArray(parts))
 }
 
 // ConvertOpenAIResponsesRequestToAntigravity translates an OpenAI Responses request
 // to the Antigravity schema using locally registered Antigravity capabilities.
-func ConvertOpenAIResponsesRequestToAntigravity(modelName string, inputRawJSON []byte, stream bool) []byte {
+func ConvertOpenAIResponsesRequestToAntigravity(modelName string, inputRawJSON []byte, stream bool) ([]byte, error) {
 	req := ConvertOpenAIResponsesRequestEnvelopeToAntigravity(context.Background(), sdktranslator.RequestEnvelope{
 		Model:  modelName,
 		Body:   inputRawJSON,
 		Stream: stream,
 	})
-	return req.Body
+	return req.Body, req.Err
 }
 
 // ConvertOpenAIResponsesRequestEnvelopeToAntigravity translates an OpenAI Responses
 // request and consumes request-scoped model capabilities from the envelope.
 func ConvertOpenAIResponsesRequestEnvelopeToAntigravity(_ context.Context, req sdktranslator.RequestEnvelope) sdktranslator.RequestEnvelope {
 	if shouldBuildAntigravityResponsesWebSearchRequest(req.Model, req.Body, req.ModelInfo) {
-		req.Body = buildAntigravityResponsesWebSearchRequest(req.Model, req.Body, req.Stream)
+		req.Body, req.Err = buildAntigravityResponsesWebSearchRequest(req.Model, req.Body, req.Stream)
 		return req
 	}
 	inputRawJSON := req.Body
-	req.Body = ConvertOpenAIResponsesRequestToGemini(req.Model, req.Body, req.Stream)
+	req.Body, req.Err = ConvertOpenAIResponsesRequestToGemini(req.Model, req.Body, req.Stream)
 	req.Body = stripAntigravityResponsesGoogleSearch(req.Body)
-	req.Body = rewriteOpenAIResponsesReasoningForAntigravityClaude(req.Model, inputRawJSON, req.Body)
-	req.Body = ConvertGeminiRequestToAntigravity(req.Model, req.Body, req.Stream)
+	req.Body = rewriteOpenAIResponsesReasoningForAntigravityClaude(req.Model, req.Body)
+	req.Body, _ = ConvertGeminiRequestToAntigravity(req.Model, req.Body, req.Stream)
 	req.Body = stripAntigravityResponsesGoogleSearch(req.Body)
 	req.Body = enableAntigravityResponsesThinkingSummary(inputRawJSON, req.Body)
 	return req
@@ -157,8 +158,9 @@ func ConvertOpenAIResponsesRequestEnvelopeToAntigravity(_ context.Context, req s
 // Antigravity only supports native search in dedicated web_search request envelopes
 // and rejects requests with mixed googleSearch and function declarations.
 func stripAntigravityResponsesGoogleSearch(payload []byte) []byte {
+	var doc *ojson.Doc
 	for _, path := range []string{"tools", "request.tools"} {
-		tools := gjson.GetBytes(payload, path)
+		tools := ojson.GetBytesNoCopy(payload, path)
 		if !tools.IsArray() {
 			continue
 		}
@@ -172,12 +174,42 @@ func stripAntigravityResponsesGoogleSearch(payload []byte) []byte {
 			filtered = append(filtered, []byte(tool.Raw))
 		}
 		if hasGoogleSearch {
+			if doc == nil {
+				doc = ojson.NewDoc(payload)
+			}
 			if len(filtered) == 0 {
-				payload, _ = sjson.DeleteBytes(payload, path)
+				_ = doc.Delete(path)
 			} else {
-				payload, _ = sjson.SetRawBytes(payload, path, translatorcommon.JoinRawArray(filtered))
+				_ = doc.SetRawBytes(path, translatorcommon.JoinRawArray(filtered))
 			}
 		}
+	}
+	if doc != nil {
+		payload = doc.Bytes()
+	}
+	return stripAntigravityServerSideToolInvocations(payload)
+}
+
+// stripAntigravityServerSideToolInvocations removes includeServerSideToolInvocations
+// injected by the shared Gemini Responses translator because Antigravity does not
+// support the includeServerSideToolInvocations parameter.
+func stripAntigravityServerSideToolInvocations(payload []byte) []byte {
+	var doc *ojson.Doc
+	for _, toolConfigPath := range []string{"toolConfig", "request.toolConfig"} {
+		flagPath := toolConfigPath + ".includeServerSideToolInvocations"
+		if !ojson.GetBytesNoCopy(payload, flagPath).Exists() {
+			continue
+		}
+		if doc == nil {
+			doc = ojson.NewDoc(payload)
+		}
+		_ = doc.Delete(flagPath)
+		if tc := doc.Get(toolConfigPath); tc.IsObject() && len(tc.Map()) == 0 {
+			_ = doc.Delete(toolConfigPath)
+		}
+	}
+	if doc != nil {
+		return doc.Bytes()
 	}
 	return payload
 }
@@ -186,23 +218,24 @@ func stripAntigravityResponsesGoogleSearch(payload []byte) []byte {
 // Antigravity needs includeThoughts to emit thought parts, so effort alone would
 // otherwise spend thinking tokens without returning a visible summary.
 func enableAntigravityResponsesThinkingSummary(inputRawJSON, translated []byte) []byte {
-	effort := gjson.GetBytes(inputRawJSON, "reasoning.effort")
-	if effort.Type != gjson.String {
+	effort := ojson.GetBytesNoCopy(inputRawJSON, "reasoning.effort")
+	if effort.Type != ojson.String {
 		return translated
 	}
 	effortVal := strings.ToLower(strings.TrimSpace(effort.String()))
 	if effortVal == "" || effortVal == "none" {
 		return translated
 	}
-	for _, path := range []string{"reasoning.summary", "reasoning.generate_summary"} {
-		if value := gjson.GetBytes(inputRawJSON, path); value.Raw != "" {
-			return translated
+	summaryConfig := thinking.ExtractSummaryConfig(inputRawJSON, "openai-response")
+	if summaryConfig.Mode == thinking.SummaryUnspecified {
+		// When effort is set but summary visibility is omitted, enable summaries
+		// by default so Antigravity emits visible thought parts (#5508).
+		summaryConfig = thinking.SummaryConfig{
+			Mode:   thinking.SummaryEnabled,
+			Detail: "auto",
 		}
 	}
-	return thinking.ApplySummaryConfig(translated, "antigravity", thinking.SummaryConfig{
-		Mode:   thinking.SummaryEnabled,
-		Detail: "auto",
-	})
+	return thinking.ApplySummaryConfig(translated, "antigravity", summaryConfig)
 }
 
 type antigravityClaudeReasoningSignature struct {
@@ -212,134 +245,128 @@ type antigravityClaudeReasoningSignature struct {
 	DetectedProvider sigcompat.SignatureProvider
 }
 
-func rewriteOpenAIResponsesReasoningForAntigravityClaude(modelName string, inputRawJSON, geminiJSON []byte) []byte {
+func rewriteOpenAIResponsesReasoningForAntigravityClaude(modelName string, geminiJSON []byte) []byte {
 	if sigcompat.SignatureProviderFromModelName(modelName) != sigcompat.SignatureProviderClaude {
 		return geminiJSON
 	}
 
-	reasoningSignatures := antigravityClaudeReasoningSignatures(inputRawJSON)
-	if len(reasoningSignatures) == 0 {
+	contents := ojson.GetBytesNoCopy(geminiJSON, "contents")
+	if !contents.IsArray() {
 		return geminiJSON
 	}
 
-	var root map[string]any
-	if err := json.Unmarshal(geminiJSON, &root); err != nil {
-		log.WithError(err).Debug("antigravity responses translator: failed to parse Gemini request for Claude signature rewrite")
-		return geminiJSON
+	contentsArray := contents.Array()
+	var rewrittenContents [][]byte
+	ensureRewrittenContents := func(upTo int) {
+		if rewrittenContents != nil {
+			return
+		}
+		rewrittenContents = make([][]byte, 0, len(contentsArray))
+		for i := 0; i < upTo; i++ {
+			rewrittenContents = append(rewrittenContents, []byte(contentsArray[i].Raw))
+		}
 	}
 
-	contents, ok := root["contents"].([]any)
-	if !ok {
-		return geminiJSON
-	}
-
-	reasoningIndex := 0
-	changed := false
-	rewrittenContents := make([]any, 0, len(contents))
-	for contentIndex, contentValue := range contents {
-		content, ok := contentValue.(map[string]any)
-		if !ok {
-			rewrittenContents = append(rewrittenContents, contentValue)
+	for contentIndex, content := range contentsArray {
+		parts := content.Get("parts")
+		if !parts.IsArray() {
+			if rewrittenContents != nil {
+				rewrittenContents = append(rewrittenContents, []byte(content.Raw))
+			}
 			continue
 		}
 
-		parts, ok := content["parts"].([]any)
-		if !ok {
-			rewrittenContents = append(rewrittenContents, content)
-			continue
+		partsArray := parts.Array()
+		var rewrittenParts [][]byte
+		ensureRewrittenParts := func(upTo int) {
+			if rewrittenParts != nil {
+				return
+			}
+			rewrittenParts = make([][]byte, 0, len(partsArray))
+			for i := 0; i < upTo; i++ {
+				rewrittenParts = append(rewrittenParts, []byte(partsArray[i].Raw))
+			}
 		}
 
-		rewrittenParts := make([]any, 0, len(parts))
-		for partIndex, partValue := range parts {
-			part, ok := partValue.(map[string]any)
-			if !ok || part["thought"] != true {
-				rewrittenParts = append(rewrittenParts, partValue)
+		for partIndex, part := range partsArray {
+			if !part.IsObject() || part.Get("thought").Type != ojson.True {
+				if rewrittenParts != nil {
+					rewrittenParts = append(rewrittenParts, []byte(part.Raw))
+				}
 				continue
 			}
 
-			var reasoningSig antigravityClaudeReasoningSignature
-			if reasoningIndex < len(reasoningSignatures) {
-				reasoningSig = reasoningSignatures[reasoningIndex]
+			sigResult := part.Get("thoughtSignature")
+			rawSignature := ""
+			if sigResult.Type == ojson.String {
+				rawSignature = sigResult.String()
 			}
-			reasoningIndex++
+			reasoningSig := antigravityClaudeReasoningSignature{
+				HasRawSignature:  sigResult.Exists(),
+				RawSignatureLen:  len(rawSignature),
+				DetectedProvider: sigcompat.SignatureProviderUnknown,
+			}
+			if rawSignature != "" {
+				reasoningSig.DetectedProvider = sigcompat.DetectSignatureProviderForBlock(rawSignature, sigcompat.SignatureBlockKindClaudeThinking)
+				if normalized, ok := sigcompat.CompatibleAntigravityClaudeThinkingSignature(rawSignature); ok {
+					reasoningSig.Signature = normalized
+				}
+			}
 
 			if reasoningSig.Signature == "" {
-				changed = true
-				logDroppedOpenAIResponsesAntigravityClaudeReasoning(modelName, contentIndex, partIndex, reasoningIndex-1, reasoningSig)
+				ensureRewrittenParts(partIndex)
+				logDroppedOpenAIResponsesAntigravityClaudeReasoning(modelName, contentIndex, partIndex, reasoningSig)
 				continue
 			}
-			if text, _ := part["text"].(string); strings.TrimSpace(text) == "" {
-				changed = true
-				logDroppedOpenAIResponsesAntigravityClaudeEmptyReasoning(modelName, contentIndex, partIndex, reasoningIndex-1, reasoningSig)
+			textResult := part.Get("text")
+			if textResult.Type != ojson.String || strings.TrimSpace(textResult.String()) == "" {
+				ensureRewrittenParts(partIndex)
+				logDroppedOpenAIResponsesAntigravityClaudeEmptyReasoning(modelName, contentIndex, partIndex, reasoningSig)
 				continue
 			}
 
-			if currentSignature, _ := part["thoughtSignature"].(string); currentSignature != reasoningSig.Signature {
-				changed = true
-				logNormalizedOpenAIResponsesAntigravityClaudeReasoning(modelName, contentIndex, partIndex, reasoningIndex-1, reasoningSig)
+			if rawSignature != reasoningSig.Signature {
+				ensureRewrittenParts(partIndex)
+				logNormalizedOpenAIResponsesAntigravityClaudeReasoning(modelName, contentIndex, partIndex, reasoningSig)
+				partDoc := ojson.NewDocString(part.Raw)
+				_ = partDoc.Set("thoughtSignature", reasoningSig.Signature)
+				rewrittenParts = append(rewrittenParts, partDoc.Bytes())
+				continue
 			}
-			part["thoughtSignature"] = reasoningSig.Signature
-			rewrittenParts = append(rewrittenParts, part)
+			if rewrittenParts != nil {
+				rewrittenParts = append(rewrittenParts, []byte(part.Raw))
+			}
 		}
 
-		if len(rewrittenParts) == 0 {
-			changed = true
+		if rewrittenParts == nil {
+			if rewrittenContents != nil {
+				rewrittenContents = append(rewrittenContents, []byte(content.Raw))
+			}
 			continue
 		}
-		content["parts"] = rewrittenParts
-		rewrittenContents = append(rewrittenContents, content)
+
+		ensureRewrittenContents(contentIndex)
+		if len(rewrittenParts) == 0 {
+			continue
+		}
+		contentDoc := ojson.NewDocString(content.Raw)
+		_ = contentDoc.SetRawBytes("parts", translatorcommon.JoinRawArray(rewrittenParts))
+		rewrittenContents = append(rewrittenContents, contentDoc.Bytes())
 	}
 
-	if !changed {
+	if rewrittenContents == nil {
 		return geminiJSON
 	}
 
-	root["contents"] = rewrittenContents
-	out, err := json.Marshal(root)
-	if err != nil {
-		log.WithError(err).Debug("antigravity responses translator: failed to marshal Claude signature rewrite")
+	doc := ojson.NewDoc(geminiJSON)
+	if errSet := doc.SetRawBytes("contents", translatorcommon.JoinRawArray(rewrittenContents)); errSet != nil {
+		log.WithError(errSet).Debug("antigravity responses translator: failed to update contents for Claude signature rewrite")
 		return geminiJSON
 	}
-	return out
+	return doc.Bytes()
 }
 
-func antigravityClaudeReasoningSignatures(inputRawJSON []byte) []antigravityClaudeReasoningSignature {
-	input := gjson.GetBytes(inputRawJSON, "input")
-	if !input.IsArray() {
-		return nil
-	}
-
-	signatures := make([]antigravityClaudeReasoningSignature, 0)
-	input.ForEach(func(_, item gjson.Result) bool {
-		itemType := item.Get("type").String()
-		if itemType == "" && item.Get("role").Exists() {
-			itemType = "message"
-		}
-		if itemType != "reasoning" {
-			return true
-		}
-
-		rawSignatureResult := item.Get("encrypted_content")
-		rawSignature := rawSignatureResult.String()
-		signature, ok := sigcompat.CompatibleAntigravityClaudeThinkingSignature(rawSignature)
-		reasoningSignature := antigravityClaudeReasoningSignature{
-			HasRawSignature:  rawSignatureResult.Exists(),
-			RawSignatureLen:  len(rawSignature),
-			DetectedProvider: sigcompat.SignatureProviderUnknown,
-		}
-		if rawSignature != "" {
-			reasoningSignature.DetectedProvider = sigcompat.DetectSignatureProviderForBlock(rawSignature, sigcompat.SignatureBlockKindClaudeThinking)
-		}
-		if ok {
-			reasoningSignature.Signature = signature
-		}
-		signatures = append(signatures, reasoningSignature)
-		return true
-	})
-	return signatures
-}
-
-func logDroppedOpenAIResponsesAntigravityClaudeReasoning(modelName string, contentIndex, partIndex, reasoningIndex int, sig antigravityClaudeReasoningSignature) {
+func logDroppedOpenAIResponsesAntigravityClaudeReasoning(modelName string, contentIndex, partIndex int, sig antigravityClaudeReasoningSignature) {
 	log.WithFields(log.Fields{
 		"component":         "signature_sanitizer",
 		"translator":        "antigravity_openai_responses",
@@ -349,14 +376,13 @@ func logDroppedOpenAIResponsesAntigravityClaudeReasoning(modelName string, conte
 		"model":             modelName,
 		"content_index":     contentIndex,
 		"part_index":        partIndex,
-		"reasoning_index":   reasoningIndex,
 		"has_signature":     sig.HasRawSignature,
 		"signature_length":  sig.RawSignatureLen,
 		"detected_provider": string(sig.DetectedProvider),
 	}).Debug("antigravity responses translator: dropped Claude reasoning block with incompatible encrypted_content")
 }
 
-func logDroppedOpenAIResponsesAntigravityClaudeEmptyReasoning(modelName string, contentIndex, partIndex, reasoningIndex int, sig antigravityClaudeReasoningSignature) {
+func logDroppedOpenAIResponsesAntigravityClaudeEmptyReasoning(modelName string, contentIndex, partIndex int, sig antigravityClaudeReasoningSignature) {
 	log.WithFields(log.Fields{
 		"component":         "signature_sanitizer",
 		"translator":        "antigravity_openai_responses",
@@ -366,14 +392,13 @@ func logDroppedOpenAIResponsesAntigravityClaudeEmptyReasoning(modelName string, 
 		"model":             modelName,
 		"content_index":     contentIndex,
 		"part_index":        partIndex,
-		"reasoning_index":   reasoningIndex,
 		"has_signature":     sig.HasRawSignature,
 		"signature_length":  sig.RawSignatureLen,
 		"detected_provider": string(sig.DetectedProvider),
 	}).Debug("antigravity responses translator: dropped Claude reasoning block with empty thinking text")
 }
 
-func logNormalizedOpenAIResponsesAntigravityClaudeReasoning(modelName string, contentIndex, partIndex, reasoningIndex int, sig antigravityClaudeReasoningSignature) {
+func logNormalizedOpenAIResponsesAntigravityClaudeReasoning(modelName string, contentIndex, partIndex int, sig antigravityClaudeReasoningSignature) {
 	log.WithFields(log.Fields{
 		"component":         "signature_sanitizer",
 		"translator":        "antigravity_openai_responses",
@@ -383,7 +408,6 @@ func logNormalizedOpenAIResponsesAntigravityClaudeReasoning(modelName string, co
 		"model":             modelName,
 		"content_index":     contentIndex,
 		"part_index":        partIndex,
-		"reasoning_index":   reasoningIndex,
 		"has_signature":     sig.HasRawSignature,
 		"signature_length":  sig.RawSignatureLen,
 		"detected_provider": string(sig.DetectedProvider),

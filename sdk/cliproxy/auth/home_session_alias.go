@@ -6,9 +6,10 @@ import (
 	"sync"
 	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	cliproxysession "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/session"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	cliproxysession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 const (
@@ -244,7 +245,7 @@ func isHierarchyParent(primary, fallback string) bool {
 	idx1 := strings.Index(primary, ":")
 	idx2 := strings.Index(fallback, ":")
 	if idx1 > 0 && idx2 > 0 && primary[:idx1] == fallback[:idx2] {
-		return true
+		return primary[:idx1] != "msg"
 	}
 	if idx1 == -1 && idx2 == -1 {
 		return true
@@ -260,10 +261,103 @@ func (m *Manager) homeDispatchSessionIDs(opts cliproxyexecutor.Options) (string,
 			primary = strings.TrimSpace(canonicalID)
 		} else if lcpID, ok := opts.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey].(string); ok && strings.TrimSpace(lcpID) != "" {
 			primary = strings.TrimSpace(lcpID)
-		} else {
-			primary, fallback = extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
-			hasAuthoritativeInput = primary != ""
 		}
+	}
+	if primary == "" && m != nil {
+		m.selectorMu.Lock()
+		selector := m.selector
+		m.selectorMu.Unlock()
+		if affinity, ok := selector.(*SessionAffinitySelector); ok && affinity != nil && affinity.matcher != nil {
+			provider := sessionMetadataString(opts.Metadata, cliproxyexecutor.SessionAffinityProviderMetadataKey)
+			if provider == "" {
+				provider = providerFromSourceFormat(opts.SourceFormat)
+			}
+			provider = canonicalLCPProvider(provider)
+			if opts.Metadata != nil && provider != "" {
+				opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = provider
+			}
+			model := sessionMetadataString(opts.Metadata, cliproxyexecutor.SessionAffinityModelMetadataKey)
+			if model == "" {
+				model = sessionMetadataString(opts.Metadata, cliproxyexecutor.RequestedModelMetadataKey)
+			}
+			namespace := lcpAffinityNamespace(provider, model, opts.Metadata)
+			if namespace != "" {
+				turns := cliproxysession.ExtractCanonicalTurns(opts.SourceFormat, opts.OriginalRequest)
+				if len(turns) > 0 {
+					fingerprints, minPrefixLength, tailFingerprints, envDigest := affinity.matcher.PrepareExt(turns)
+					if len(fingerprints) > 0 && minPrefixLength > 0 && minPrefixLength <= len(fingerprints) {
+						if match, okMatch := affinity.matcher.MatchFingerprintsWithContext(namespace, fingerprints, tailFingerprints, envDigest, minPrefixLength); okMatch {
+							primary = match.SessionID
+							if match.ParentSessionID != "" {
+								fallback = match.ParentSessionID
+								if opts.Metadata != nil {
+									opts.Metadata[cliproxyexecutor.ParentSessionIDMetadataKey] = match.ParentSessionID
+								}
+							}
+							if opts.Metadata != nil {
+								opts.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey] = match.SessionID
+								opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey] = match.SessionID
+								if match.AccessNumber > 0 {
+									opts.Metadata[cliproxyexecutor.LCPAccessGenerationMetadataKey] = match.AccessNumber
+								} else {
+									delete(opts.Metadata, cliproxyexecutor.LCPAccessGenerationMetadataKey)
+								}
+								if match.IsFork {
+									opts.Metadata[cliproxyexecutor.IsForkMetadataKey] = true
+									delete(opts.Metadata, cliproxyexecutor.IsCompactionMetadataKey)
+									opts.Metadata[cliproxyexecutor.NodeKindMetadataKey] = "fork"
+								} else if match.IsCompaction {
+									opts.Metadata[cliproxyexecutor.IsCompactionMetadataKey] = true
+									delete(opts.Metadata, cliproxyexecutor.IsForkMetadataKey)
+									opts.Metadata[cliproxyexecutor.NodeKindMetadataKey] = "compaction"
+								} else {
+									delete(opts.Metadata, cliproxyexecutor.IsForkMetadataKey)
+									delete(opts.Metadata, cliproxyexecutor.IsCompactionMetadataKey)
+									delete(opts.Metadata, cliproxyexecutor.NodeKindMetadataKey)
+								}
+							}
+						} else {
+							bindRes := affinity.matcher.BindFingerprintsWithContext(namespace, fingerprints, tailFingerprints, envDigest, minPrefixLength, "home-pending")
+							if bindRes.SessionID != "" {
+								primary = bindRes.SessionID
+								if bindRes.ParentSessionID != "" {
+									fallback = bindRes.ParentSessionID
+									if opts.Metadata != nil {
+										opts.Metadata[cliproxyexecutor.ParentSessionIDMetadataKey] = bindRes.ParentSessionID
+									}
+								}
+								if opts.Metadata != nil {
+									opts.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey] = bindRes.SessionID
+									opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey] = bindRes.SessionID
+									if bindRes.AccessNumber > 0 {
+										opts.Metadata[cliproxyexecutor.LCPAccessGenerationMetadataKey] = bindRes.AccessNumber
+									} else {
+										delete(opts.Metadata, cliproxyexecutor.LCPAccessGenerationMetadataKey)
+									}
+									if bindRes.IsFork {
+										opts.Metadata[cliproxyexecutor.IsForkMetadataKey] = true
+										delete(opts.Metadata, cliproxyexecutor.IsCompactionMetadataKey)
+										opts.Metadata[cliproxyexecutor.NodeKindMetadataKey] = "fork"
+									} else if bindRes.IsCompaction {
+										opts.Metadata[cliproxyexecutor.IsCompactionMetadataKey] = true
+										delete(opts.Metadata, cliproxyexecutor.IsForkMetadataKey)
+										opts.Metadata[cliproxyexecutor.NodeKindMetadataKey] = "compaction"
+									} else {
+										delete(opts.Metadata, cliproxyexecutor.IsForkMetadataKey)
+										delete(opts.Metadata, cliproxyexecutor.IsCompactionMetadataKey)
+										delete(opts.Metadata, cliproxyexecutor.NodeKindMetadataKey)
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	if primary == "" {
+		primary, fallback = extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+		hasAuthoritativeInput = primary != ""
 	}
 	if primary == "" || m == nil {
 		return primary, ""
@@ -311,4 +405,17 @@ func (m *Manager) homeDispatchSessionIDs(opts cliproxyexecutor.Options) (string,
 func (m *Manager) homeDispatchSessionID(opts cliproxyexecutor.Options) string {
 	sessionID, _ := m.homeDispatchSessionIDs(opts)
 	return sessionID
+}
+
+func providerFromSourceFormat(format sdktranslator.Format) string {
+	switch {
+	case strings.EqualFold(string(format), string(sdktranslator.FormatGemini)), strings.EqualFold(string(format), string(sdktranslator.FormatAntigravity)):
+		return "google"
+	case strings.EqualFold(string(format), string(sdktranslator.FormatClaude)):
+		return "claude"
+	case strings.EqualFold(string(format), string(sdktranslator.FormatInteractions)):
+		return "devin"
+	default:
+		return "openai"
+	}
 }

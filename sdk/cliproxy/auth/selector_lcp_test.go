@@ -9,8 +9,8 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 func TestSessionAffinitySelectorLCPPreservesBindingAcrossConversationGrowth(t *testing.T) {
@@ -674,6 +674,49 @@ func TestSessionAffinityBodyOnlyCodexFork(t *testing.T) {
 	}
 	if isFork, ok := forkOpts.Metadata[cliproxyexecutor.IsForkMetadataKey].(bool); !ok || !isFork {
 		t.Fatalf("expected is_fork=true for body-only fork, got %v", forkOpts.Metadata[cliproxyexecutor.IsForkMetadataKey])
+	}
+}
+
+func TestSessionAffinityForkFailurePreservesParentBinding(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &RoundRobinSelector{},
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{{ID: "auth-a"}, {ID: "auth-b"}}
+	parentOpts := cliproxyexecutor.Options{
+		OriginalRequest: []byte(`{"conversation":{"id":"parent-1"},"messages":[{"role":"user","content":"parent"}]}`),
+	}
+	parentAuth, errParent := selector.Pick(context.Background(), "openai", "model", parentOpts, auths)
+	if errParent != nil || parentAuth.ID != "auth-a" {
+		t.Fatalf("parent Pick() error = %v, auth = %v", errParent, parentAuth)
+	}
+
+	forkOpts := cliproxyexecutor.Options{
+		OriginalRequest: []byte(`{"prompt_cache_key":"fork-1","conversation":{"id":"parent-1"},"messages":[{"role":"user","content":"fork"}]}`),
+		Metadata: map[string]any{
+			cliproxyexecutor.IsForkMetadataKey: true,
+		},
+	}
+	forkAuth, errFork := selector.Pick(context.Background(), "openai", "model", forkOpts, auths)
+	if errFork != nil || forkAuth.ID != "auth-a" {
+		t.Fatalf("fork Pick() error = %v, auth = %v", errFork, forkAuth)
+	}
+
+	selector.OnResult(Result{
+		Provider: "openai",
+		Model:    "model",
+		AuthID:   forkAuth.ID,
+		Success:  false,
+		Options:  forkOpts,
+	})
+
+	boundID, ok := selector.boundAuthForRequest([]string{"openai"}, "model", parentOpts)
+	if !ok || boundID != "auth-a" {
+		t.Fatalf("parent binding after fork failure = (%q, %v), want (auth-a, true)", boundID, ok)
 	}
 }
 
@@ -1477,6 +1520,341 @@ func TestSessionAffinityCodexForkWithSessionIdHeaderAndBodyThreadId(t *testing.T
 	}
 	if isFork, ok := forkOpts.Metadata[cliproxyexecutor.IsForkMetadataKey].(bool); !ok || !isFork {
 		t.Fatalf("expected is_fork=true, got %v", forkOpts.Metadata[cliproxyexecutor.IsForkMetadataKey])
+	}
+}
+
+func TestSessionAffinitySelectorLCPCompactionPreservesAffinityAndLineage(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		TTL: time.Hour,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{
+		{ID: "auth-1", Status: StatusActive},
+		{ID: "auth-2", Status: StatusActive},
+	}
+
+	// 1. Initial 5-turn conversation without explicit session headers (relies on LCP)
+	firstPayload := []byte(`{"contents":[
+		{"role":"user","parts":[{"text":"step 1"}]},
+		{"role":"model","parts":[{"text":"ack 1"}]},
+		{"role":"user","parts":[{"text":"step 2"}]},
+		{"role":"model","parts":[{"text":"ack 2"}]},
+		{"role":"user","parts":[{"text":"step 3"}]}
+	]}`)
+	firstOpts := cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FormatGemini,
+		OriginalRequest: firstPayload,
+		Metadata: map[string]any{
+			cliproxyexecutor.CallerScopeMetadataKey: "caller-harness-1",
+		},
+	}
+	ctx := context.Background()
+	firstAuth, errFirst := selector.Pick(ctx, "google", "gemini-2.5-pro", firstOpts, auths)
+	if errFirst != nil {
+		t.Fatalf("first Pick() error = %v", errFirst)
+	}
+	initialSessionID, _ := firstOpts.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey].(string)
+	if initialSessionID == "" {
+		t.Fatal("first Pick() did not set LCPAffinitySessionIDMetadataKey")
+	}
+
+	// Complete initial request
+	selector.OnResult(Result{
+		AuthID:   firstAuth.ID,
+		Provider: "google",
+		Model:    "gemini-2.5-pro",
+		Options:  firstOpts,
+		Success:  true,
+	})
+
+	// 2. Downstream harness compacts context:
+	// Early steps (1..2) summarized into a single turn, preserving step 3 and appending step 4
+	compactedPayload := []byte(`{"contents":[
+		{"role":"user","parts":[{"text":"<summary>Steps 1 and 2 completed</summary>"}]},
+		{"role":"model","parts":[{"text":"ack 2"}]},
+		{"role":"user","parts":[{"text":"step 3"}]},
+		{"role":"user","parts":[{"text":"step 4"}]}
+	]}`)
+	compactedOpts := cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FormatGemini,
+		OriginalRequest: compactedPayload,
+		Metadata: map[string]any{
+			cliproxyexecutor.CallerScopeMetadataKey: "caller-harness-1",
+		},
+	}
+
+	compactedAuth, errCompacted := selector.Pick(ctx, "google", "gemini-2.5-pro", compactedOpts, auths)
+	if errCompacted != nil {
+		t.Fatalf("compacted Pick() error = %v", errCompacted)
+	}
+
+	// Credential affinity must be preserved across compaction
+	if compactedAuth.ID != firstAuth.ID {
+		t.Fatalf("compacted Pick() auth drifted: got %q, want %q", compactedAuth.ID, firstAuth.ID)
+	}
+
+	// Lineage must link back to pre-compaction session
+	parentID, _ := compactedOpts.Metadata[cliproxyexecutor.ParentSessionIDMetadataKey].(string)
+	if parentID != initialSessionID {
+		t.Fatalf("compacted ParentSessionID = %q, want %q", parentID, initialSessionID)
+	}
+
+	// Compaction milestone must be distinguished from divergent fork
+	if isCompaction, ok := compactedOpts.Metadata[cliproxyexecutor.IsCompactionMetadataKey].(bool); !ok || !isCompaction {
+		t.Fatalf("expected is_compaction=true, got %v", compactedOpts.Metadata[cliproxyexecutor.IsCompactionMetadataKey])
+	}
+	if nodeKind, ok := compactedOpts.Metadata[cliproxyexecutor.NodeKindMetadataKey].(string); !ok || nodeKind != "compaction" {
+		t.Fatalf("expected node_kind=compaction, got %v", compactedOpts.Metadata[cliproxyexecutor.NodeKindMetadataKey])
+	}
+	if isFork, ok := compactedOpts.Metadata[cliproxyexecutor.IsForkMetadataKey].(bool); ok && isFork {
+		t.Fatal("compacted continuation should not be marked as fork")
+	}
+
+	// Complete compacted request
+	selector.OnResult(Result{
+		AuthID:   compactedAuth.ID,
+		Provider: "google",
+		Model:    "gemini-2.5-pro",
+		Options:  compactedOpts,
+		Success:  true,
+	})
+
+	// 3. Subsequent turn grows linearly from compaction boundary
+	nextPayload := []byte(`{"contents":[
+		{"role":"user","parts":[{"text":"<summary>Steps 1 and 2 completed</summary>"}]},
+		{"role":"model","parts":[{"text":"ack 2"}]},
+		{"role":"user","parts":[{"text":"step 3"}]},
+		{"role":"user","parts":[{"text":"step 4"}]},
+		{"role":"model","parts":[{"text":"ack 4"}]}
+	]}`)
+	nextOpts := cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FormatGemini,
+		OriginalRequest: nextPayload,
+		Metadata: map[string]any{
+			cliproxyexecutor.CallerScopeMetadataKey: "caller-harness-1",
+		},
+	}
+	nextAuth, errNext := selector.Pick(ctx, "google", "gemini-2.5-pro", nextOpts, auths)
+	if errNext != nil {
+		t.Fatalf("next Pick() error = %v", errNext)
+	}
+	if nextAuth.ID != firstAuth.ID {
+		t.Fatalf("next Pick() auth drifted: got %q, want %q", nextAuth.ID, firstAuth.ID)
+	}
+	compactedSessionID, _ := compactedOpts.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey].(string)
+	nextSessionID, _ := nextOpts.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey].(string)
+	if nextSessionID != compactedSessionID {
+		t.Fatalf("linear extension session changed: got %q, want %q", nextSessionID, compactedSessionID)
+	}
+	if isFork, ok := nextOpts.Metadata[cliproxyexecutor.IsForkMetadataKey].(bool); ok && isFork {
+		t.Fatal("linear continuation must not be marked as fork")
+	}
+}
+
+func TestSessionAffinitySelectorLookupAffinityProviderAlias(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		TTL: time.Hour,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{{ID: "auth-gemini-1", Status: StatusActive}}
+	opts := cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FormatGemini,
+		OriginalRequest: []byte(`{"contents":[{"role":"user","parts":[{"text":"hello lookup"}]}]}`),
+		Metadata: map[string]any{
+			cliproxyexecutor.CallerScopeMetadataKey:             "caller-lookup",
+			cliproxyexecutor.SessionAffinityProviderMetadataKey: "google",
+		},
+	}
+	ctx := context.Background()
+	picked, errPick := selector.Pick(ctx, "google", "gemini-2.5-pro", opts, auths)
+	if errPick != nil || picked == nil {
+		t.Fatalf("Pick() failed: %v", errPick)
+	}
+
+	lcpID, ok := opts.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey].(string)
+	if !ok || lcpID == "" {
+		t.Fatal("expected LCPAffinitySessionIDMetadataKey to be set")
+	}
+
+	// Query with alias "gemini" instead of "google"
+	boundAuth, status := selector.LookupAffinity("gemini", "gemini-2.5-pro", lcpID)
+	if status != "bound" || boundAuth != "auth-gemini-1" {
+		t.Fatalf("LookupAffinity(gemini) = (%q, %q), want (auth-gemini-1, bound)", boundAuth, status)
+	}
+
+	// Query with "google"
+	boundAuthGoogle, statusGoogle := selector.LookupAffinity("google", "gemini-2.5-pro", lcpID)
+	if statusGoogle != "bound" || boundAuthGoogle != "auth-gemini-1" {
+		t.Fatalf("LookupAffinity(google) = (%q, %q), want (auth-gemini-1, bound)", boundAuthGoogle, statusGoogle)
+	}
+}
+
+func TestSessionAffinitySelectorLCPNamespaceDistinctAcrossGoogleProviders(t *testing.T) {
+	t.Parallel()
+
+	meta := map[string]any{
+		cliproxyexecutor.CallerScopeMetadataKey: "caller-1",
+	}
+	geminiNS := lcpAffinityNamespace("gemini", "gemini-2.5-pro", meta)
+	vertexNS := lcpAffinityNamespace("vertex", "gemini-2.5-pro", meta)
+	aistudioNS := lcpAffinityNamespace("aistudio", "gemini-2.5-pro", meta)
+	googleNS := lcpAffinityNamespace("google", "gemini-2.5-pro", meta)
+
+	if geminiNS != "lcp:v1::gemini::gemini-2.5-pro::caller-1" {
+		t.Fatalf("gemini namespace = %q, want %q", geminiNS, "lcp:v1::gemini::gemini-2.5-pro::caller-1")
+	}
+	if vertexNS != "lcp:v1::vertex::gemini-2.5-pro::caller-1" {
+		t.Fatalf("vertex namespace = %q, want %q", vertexNS, "lcp:v1::vertex::gemini-2.5-pro::caller-1")
+	}
+	if aistudioNS != "lcp:v1::aistudio::gemini-2.5-pro::caller-1" {
+		t.Fatalf("aistudio namespace = %q, want %q", aistudioNS, "lcp:v1::aistudio::gemini-2.5-pro::caller-1")
+	}
+	if googleNS != geminiNS {
+		t.Fatalf("google alias namespace = %q, want %q", googleNS, geminiNS)
+	}
+}
+
+func TestSessionAffinitySelectorLCPCrossProviderIsolationGeminiVertexAIStudio(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &RoundRobinSelector{},
+		TTL:      time.Hour,
+	})
+	defer selector.Stop()
+
+	geminiAuths := []*Auth{
+		{ID: "gemini-auth-1", Provider: "gemini", Status: StatusActive},
+		{ID: "gemini-auth-2", Provider: "gemini", Status: StatusActive},
+	}
+	vertexAuths := []*Auth{
+		{ID: "vertex-auth-1", Provider: "vertex", Status: StatusActive},
+		{ID: "vertex-auth-2", Provider: "vertex", Status: StatusActive},
+	}
+	aistudioAuths := []*Auth{
+		{ID: "aistudio-auth-1", Provider: "aistudio", Status: StatusActive},
+		{ID: "aistudio-auth-2", Provider: "aistudio", Status: StatusActive},
+	}
+
+	initialPayload := []byte(`{"contents":[{"role":"user","parts":[{"text":"shared prefix turn 1"}]}]}`)
+	followupPayload := []byte(`{"contents":[{"role":"user","parts":[{"text":"shared prefix turn 1"}]},{"role":"model","parts":[{"text":"reply 1"}]},{"role":"user","parts":[{"text":"turn 2"}]}]}`)
+	newOpts := func(payload []byte) cliproxyexecutor.Options {
+		return cliproxyexecutor.Options{
+			SourceFormat:    sdktranslator.FormatGemini,
+			OriginalRequest: payload,
+			Metadata: map[string]any{
+				cliproxyexecutor.CallerScopeMetadataKey: "caller-shared-1",
+			},
+		}
+	}
+
+	ctx := context.Background()
+	model := "gemini-2.5-pro"
+
+	geminiOpts1 := newOpts(initialPayload)
+	geminiFirst, errGemini1 := selector.Pick(ctx, "gemini", model, geminiOpts1, geminiAuths)
+	if errGemini1 != nil || geminiFirst == nil || geminiFirst.ID != "gemini-auth-1" {
+		t.Fatalf("gemini initial Pick() = (%v, %v), want gemini-auth-1", geminiFirst, errGemini1)
+	}
+	geminiSessionID, _ := geminiOpts1.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey].(string)
+	if geminiSessionID == "" {
+		t.Fatal("expected gemini LCP session ID")
+	}
+
+	vertexOpts1 := newOpts(initialPayload)
+	vertexFirst, errVertex1 := selector.Pick(ctx, "vertex", model, vertexOpts1, vertexAuths)
+	if errVertex1 != nil || vertexFirst == nil || vertexFirst.ID != "vertex-auth-1" {
+		t.Fatalf("vertex initial Pick() = (%v, %v), want vertex-auth-1", vertexFirst, errVertex1)
+	}
+
+	aistudioOpts1 := newOpts(initialPayload)
+	aistudioFirst, errAIStudio1 := selector.Pick(ctx, "aistudio", model, aistudioOpts1, aistudioAuths)
+	if errAIStudio1 != nil || aistudioFirst == nil || aistudioFirst.ID != "aistudio-auth-1" {
+		t.Fatalf("aistudio initial Pick() = (%v, %v), want aistudio-auth-1", aistudioFirst, errAIStudio1)
+	}
+
+	// LookupAffinity for vertex must not match gemini's LCP session ID.
+	if gotAuth, gotStatus := selector.LookupAffinity("vertex", model, geminiSessionID); gotStatus != "unbound" || gotAuth != "" {
+		t.Fatalf("LookupAffinity(vertex, geminiSessionID) = (%q, %q), want (empty, unbound)", gotAuth, gotStatus)
+	}
+
+	// Follow-up gemini turn must retain gemini-auth-1 rather than cold-rebinding after vertex/aistudio picks.
+	geminiOpts2 := newOpts(followupPayload)
+	geminiSecond, errGemini2 := selector.Pick(ctx, "gemini", model, geminiOpts2, geminiAuths)
+	if errGemini2 != nil || geminiSecond == nil || geminiSecond.ID != "gemini-auth-1" {
+		t.Fatalf("gemini follow-up Pick() = (%v, %v), want preserved gemini-auth-1", geminiSecond, errGemini2)
+	}
+
+	// Follow-up vertex turn must retain vertex-auth-1 as well.
+	vertexOpts2 := newOpts(followupPayload)
+	vertexSecond, errVertex2 := selector.Pick(ctx, "vertex", model, vertexOpts2, vertexAuths)
+	if errVertex2 != nil || vertexSecond == nil || vertexSecond.ID != "vertex-auth-1" {
+		t.Fatalf("vertex follow-up Pick() = (%v, %v), want preserved vertex-auth-1", vertexSecond, errVertex2)
+	}
+
+	// Credential-attributed failure on vertex must not evict gemini's binding.
+	selector.OnResult(Result{
+		AuthID:   vertexSecond.ID,
+		Provider: "vertex",
+		Model:    model,
+		Options:  vertexOpts2,
+		Success:  false,
+		Error:    &Error{Code: "rate_limit", HTTPStatus: http.StatusTooManyRequests},
+	})
+
+	geminiOpts3 := newOpts(followupPayload)
+	geminiThird, errGemini3 := selector.Pick(ctx, "gemini", model, geminiOpts3, geminiAuths)
+	if errGemini3 != nil || geminiThird == nil || geminiThird.ID != "gemini-auth-1" {
+		t.Fatalf("gemini Pick() after vertex failure = (%v, %v), want preserved gemini-auth-1", geminiThird, errGemini3)
+	}
+}
+
+func TestSessionAffinitySelectorLCPRebindOnNeverIsolatedAcrossGeminiAndVertex(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &RoundRobinSelector{},
+		TTL:      time.Hour,
+		RebindOn: SessionAffinityRebindOnNever,
+	})
+	defer selector.Stop()
+
+	geminiAuths := []*Auth{{ID: "gemini-auth-1", Provider: "gemini", Status: StatusActive}}
+	vertexAuths := []*Auth{{ID: "vertex-auth-1", Provider: "vertex", Status: StatusActive}}
+	payload := []byte(`{"contents":[{"role":"user","parts":[{"text":"never-rebind shared prefix"}]}]}`)
+	newOpts := func() cliproxyexecutor.Options {
+		return cliproxyexecutor.Options{
+			SourceFormat:    sdktranslator.FormatGemini,
+			OriginalRequest: payload,
+			Metadata: map[string]any{
+				cliproxyexecutor.CallerScopeMetadataKey: "caller-never-1",
+			},
+		}
+	}
+
+	ctx := context.Background()
+	model := "gemini-2.5-pro"
+
+	geminiPicked, errGemini := selector.Pick(ctx, "gemini", model, newOpts(), geminiAuths)
+	if errGemini != nil || geminiPicked == nil || geminiPicked.ID != "gemini-auth-1" {
+		t.Fatalf("gemini Pick() = (%v, %v), want gemini-auth-1", geminiPicked, errGemini)
+	}
+
+	// Before vertex binds, boundAuthForRequest for vertex must not return gemini's bound auth.
+	if boundID, okBound := selector.boundAuthForRequest([]string{"vertex"}, model, newOpts()); okBound || boundID != "" {
+		t.Fatalf("boundAuthForRequest(vertex) = (%q, %v), want (empty, false)", boundID, okBound)
+	}
+
+	// Under rebind-on: never, vertex must select its own credential instead of failing with session_auth_unavailable.
+	vertexPicked, errVertex := selector.Pick(ctx, "vertex", model, newOpts(), vertexAuths)
+	if errVertex != nil || vertexPicked == nil || vertexPicked.ID != "vertex-auth-1" {
+		t.Fatalf("vertex Pick() under rebind-on:never = (%v, %v), want vertex-auth-1", vertexPicked, errVertex)
 	}
 }
 

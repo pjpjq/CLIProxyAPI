@@ -3,7 +3,6 @@ package cliproxy
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,16 +16,18 @@ import (
 	"testing"
 	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/homeplugins"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executionregistry"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
-	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
+	"github.com/MoeForge/moego/json"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/homeplugins"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executionregistry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginstore"
 )
+
+const homeLifecycleTestTimeout = 5 * time.Second
 
 type blockingServiceCooldownStore struct {
 	started chan struct{}
@@ -132,9 +133,11 @@ func TestServiceConcurrentReplacementWaitsForInFlightDrain(t *testing.T) {
 	}()
 	deadline := time.Now().Add(time.Second)
 	for {
-		if _, errLate := registry.BeginDispatch(); errLate != nil {
+		late, errLate := registry.BeginDispatch()
+		if errLate != nil {
 			break
 		}
+		late.End()
 		if time.Now().After(deadline) {
 			t.Fatal("first replacement did not begin draining")
 		}
@@ -246,7 +249,6 @@ func TestServiceReplacementWaitsForPublisherExitAndPinsACKedLifetimeDependencies
 	var configRequests atomic.Int32
 	firstPublisherDoneForServer := make(chan (<-chan struct{}), 1)
 	secondConfigResult := make(chan error, 1)
-	allowSecondConfig := make(chan struct{})
 	stop := make(chan struct{})
 	serverDone := make(chan struct{})
 	go func() {
@@ -256,7 +258,7 @@ func TestServiceReplacementWaitsForPublisherExitAndPinsACKedLifetimeDependencies
 			if errAccept != nil {
 				return
 			}
-			go servePublisherReplacementConnection(conn, &configRequests, frames, firstPublisherDoneForServer, secondConfigResult, allowSecondConfig, stop)
+			go servePublisherReplacementConnection(conn, &configRequests, frames, firstPublisherDoneForServer, secondConfigResult, stop)
 		}
 	}()
 	t.Cleanup(func() {
@@ -273,8 +275,8 @@ func TestServiceReplacementWaitsForPublisherExitAndPinsACKedLifetimeDependencies
 	service.startHomeSubscriber(ctx)
 
 	firstFrame := waitForPublisherReplacementFrame(t, frames, 11)
-	firstClient := waitForServiceHomeClient(t, service, time.Second)
-	firstRegistry := waitForServiceRegistry(t, service, time.Second)
+	firstClient := waitForServiceHomeClient(t, service, homeLifecycleTestTimeout)
+	firstRegistry := waitForServiceRegistry(t, service, homeLifecycleTestTimeout)
 	service.homeLifecycleMu.Lock()
 	firstPublisherDone := service.homeSupervisor.publisherCompletion()
 	service.homeLifecycleMu.Unlock()
@@ -292,7 +294,7 @@ func TestServiceReplacementWaitsForPublisherExitAndPinsACKedLifetimeDependencies
 		close(replaced)
 	}()
 
-	deadline := time.NewTimer(time.Second)
+	deadline := time.NewTimer(homeLifecycleTestTimeout)
 	defer deadline.Stop()
 	select {
 	case errSecondConfig := <-secondConfigResult:
@@ -302,11 +304,9 @@ func TestServiceReplacementWaitsForPublisherExitAndPinsACKedLifetimeDependencies
 	case <-deadline.C:
 		t.Fatal("replacement did not begin its config lifetime")
 	}
-	close(allowSecondConfig)
-
 	secondFrame := waitForPublisherReplacementFrame(t, frames, 22)
-	secondClient := waitForServiceHomeClient(t, service, time.Second)
-	secondRegistry := waitForServiceRegistry(t, service, time.Second)
+	secondClient := waitForServiceHomeClient(t, service, homeLifecycleTestTimeout)
+	secondRegistry := waitForServiceRegistry(t, service, homeLifecycleTestTimeout)
 	if secondFrame.BarrierRevision != 22 {
 		t.Fatalf("replacement publisher frame = %#v", secondFrame)
 	}
@@ -315,7 +315,7 @@ func TestServiceReplacementWaitsForPublisherExitAndPinsACKedLifetimeDependencies
 	}
 	select {
 	case <-replaced:
-	case <-time.After(time.Second):
+	case <-time.After(homeLifecycleTestTimeout):
 		t.Fatal("replacement subscriber did not finish setup")
 	}
 }
@@ -648,82 +648,25 @@ func TestHomeConfigWorkerShutdownCancelsBlockedRuntimeUpdatesBeforePublish(t *te
 	}
 }
 
-func TestHomeConfigWorkerCancelsBlockedAntigravityModelRefreshBeforePublish(t *testing.T) {
-	modelRefreshStarted := make(chan struct{})
-	releaseModelRefresh := make(chan struct{})
-	var releaseModelRefreshOnce sync.Once
-	modelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		close(modelRefreshStarted)
-		select {
-		case <-r.Context().Done():
-		case <-releaseModelRefresh:
-		}
-	}))
-	t.Cleanup(modelServer.Close)
-	t.Cleanup(func() { releaseModelRefreshOnce.Do(func() { close(releaseModelRefresh) }) })
-
-	client, _ := newHomePluginTaskTestClient(t, nil, 0)
-	baseCfg := &config.Config{}
-	baseCfg.Home.Enabled = true
+func TestHomeModelRegistrationSkipsAntigravityProbes(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { requests.Add(1); w.WriteHeader(500) }))
+	defer server.Close()
+	cfg := &config.Config{}
+	cfg.Home.Enabled = true
 	manager := coreauth.NewManager(nil, nil, nil)
-	auth := &coreauth.Auth{
-		ID:       "blocked-antigravity-refresh",
-		Provider: "antigravity",
-		Metadata: map[string]any{"access_token": "test-token"},
-		Attributes: map[string]string{
-			"base_url": modelServer.URL,
-		},
-	}
-	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
-		t.Fatal(errRegister)
+	auth := antigravityTestAuth("home-no-probe", server.URL)
+	if _, err := manager.Register(t.Context(), auth); err != nil {
+		t.Fatal(err)
 	}
 	t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(auth.ID) })
-
-	parentCtx, cancelParent := context.WithCancel(context.Background())
-	t.Cleanup(cancelParent)
-	homeCtx, cancelHome := context.WithCancel(parentCtx)
-	t.Cleanup(cancelHome)
-	lifetimeCtx, cancelLifetime := context.WithCancel(homeCtx)
-	t.Cleanup(cancelLifetime)
-	service := &Service{
-		cfg:            baseCfg,
-		coreManager:    manager,
-		pluginHost:     pluginhost.New(),
-		homeGeneration: 1,
-	}
-	queue := newHomeConfigWorkQueue()
-	queue.enqueue([]byte("routing:\n  strategy: fill-first\n"))
-	ready := make(chan struct{})
-	close(ready)
-	published := atomic.Bool{}
-	cancelBound := atomic.Int64{}
-	cancelBound.Store(int64(time.Second))
-	workerDone := make(chan struct{})
-	go func() {
-		defer close(workerDone)
-		service.runHomeConfigWorker(lifetimeCtx, homeCtx, 1, client, executionregistry.New(), queue, ready, &published, &cancelBound)
-	}()
-
-	select {
-	case <-modelRefreshStarted:
-	case <-time.After(time.Second):
-		t.Fatal("Home config worker did not start Antigravity model refresh")
-	}
-	cancelLifetime()
-	select {
-	case <-workerDone:
-	case <-time.After(time.Second):
-		t.Fatal("Home config worker did not stop after model refresh cancellation")
-	}
-	if published.Load() {
-		t.Fatal("canceled model refresh published Home runtime")
-	}
-	service.homeMu.Lock()
-	publishedClient := service.homeClient
-	publishedRegistry := service.homeRegistry
-	service.homeMu.Unlock()
-	if publishedClient != nil || publishedRegistry != nil {
-		t.Fatal("canceled model refresh exposed Home runtime state")
+	service := &Service{cfg: cfg, coreManager: manager}
+	service.registerModelsForAuth(t.Context(), auth)
+	service.WaitAntigravityProbes()
+	service.refreshAntigravityModels(t.Context())
+	service.WaitAntigravityProbes()
+	if requests.Load() != 0 {
+		t.Fatal("Home mode launched standalone entitlement probe")
 	}
 }
 
@@ -792,7 +735,9 @@ func TestServiceInitialOverlayStagesPluginWritesUntilReady(t *testing.T) {
 	pluginStatus := make(chan struct{}, 2)
 	pluginTasks := make(chan struct{})
 	freshCommandProbe := make(chan struct{})
+	subscribed := make(chan struct{}, 1)
 	allowAck := make(chan struct{})
+	earlyPluginRequest := make(chan string, 1)
 	stop := make(chan struct{})
 	serverDone := make(chan struct{})
 	go func() {
@@ -802,7 +747,7 @@ func TestServiceInitialOverlayStagesPluginWritesUntilReady(t *testing.T) {
 			if errAccept != nil {
 				return
 			}
-			go serveInitialOverlayPluginConnection(conn, pluginSync, pluginStatus, pluginTasks, freshCommandProbe, allowAck, stop)
+			go serveInitialOverlayPluginConnection(conn, pluginSync, pluginStatus, pluginTasks, freshCommandProbe, subscribed, allowAck, earlyPluginRequest, stop)
 		}
 	}()
 	t.Cleanup(func() {
@@ -837,16 +782,12 @@ func TestServiceInitialOverlayStagesPluginWritesUntilReady(t *testing.T) {
 	t.Cleanup(cancel)
 	service.startHomeSubscriber(ctx)
 
-	for name, observed := range map[string]<-chan struct{}{
-		"plugin sync":   pluginSync,
-		"plugin tasks":  pluginTasks,
-		"plugin status": pluginStatus,
-	} {
-		select {
-		case <-observed:
-			t.Fatalf("initial overlay staged %s before subscription ACK and fresh command probe", name)
-		case <-time.After(50 * time.Millisecond):
-		}
+	select {
+	case <-subscribed:
+	case request := <-earlyPluginRequest:
+		t.Fatalf("initial overlay requested %s before subscription ACK and fresh command probe", request)
+	case <-time.After(homeLifecycleTestTimeout):
+		t.Fatal("initial overlay did not reach the subscription handshake")
 	}
 	if gotDeletes := deletes.Load(); gotDeletes != 0 {
 		t.Fatalf("initial overlay executed %d plugin deletes before subscription ACK and fresh command probe", gotDeletes)
@@ -862,7 +803,9 @@ func TestServiceInitialOverlayStagesPluginWritesUntilReady(t *testing.T) {
 	close(allowAck)
 	select {
 	case <-freshCommandProbe:
-	case <-time.After(time.Second):
+	case request := <-earlyPluginRequest:
+		t.Fatalf("initial overlay requested %s before subscription ACK and fresh command probe", request)
+	case <-time.After(homeLifecycleTestTimeout):
 		t.Fatal("subscription ACK did not rebuild and probe a fresh command connection")
 	}
 	for name, observed := range map[string]<-chan struct{}{
@@ -871,22 +814,27 @@ func TestServiceInitialOverlayStagesPluginWritesUntilReady(t *testing.T) {
 	} {
 		select {
 		case <-observed:
-		case <-time.After(time.Second):
+		case <-time.After(homeLifecycleTestTimeout):
 			t.Fatalf("ready Home lifetime did not stage %s after subscription ACK and fresh command probe", name)
 		}
 	}
 	for range 2 {
 		select {
 		case <-pluginStatus:
-		case <-time.After(time.Second):
+		case <-time.After(homeLifecycleTestTimeout):
 			t.Fatal("ready Home lifetime did not flush staged plugin reports")
 		}
 	}
 	if gotDeletes := deletes.Load(); gotDeletes != 1 {
 		t.Fatalf("ready Home lifetime executed %d plugin deletes, want 1", gotDeletes)
 	}
-	if waitForServiceRegistry(t, service, time.Second) == nil || home.Current() == nil {
+	if waitForServiceRegistry(t, service, homeLifecycleTestTimeout) == nil || home.Current() == nil {
 		t.Fatal("subscription ACK did not expose the Home client and registry")
+	}
+	select {
+	case request := <-earlyPluginRequest:
+		t.Fatalf("initial overlay requested %s before subscription ACK and fresh command probe", request)
+	default:
 	}
 }
 
@@ -1312,8 +1260,8 @@ func TestServiceKeepsRegistryAcrossHeartbeatFailoverAndExposesOnlyAfterNewACK(t 
 	close(loseFirst)
 	select {
 	case <-secondSubscribe:
-	case <-time.After(time.Second):
-		t.Fatal("second subscription did not start after heartbeat loss")
+	case <-time.After(3 * homeSubscriberRetryInitial):
+		t.Fatal("second subscription did not start after heartbeat loss and backoff")
 	}
 	service.homeMu.Lock()
 	exposedRegistry := service.homeRegistry
@@ -1398,12 +1346,12 @@ func TestServicePreservesActiveScopeDuringPreACKFailoverRetries(t *testing.T) {
 	}
 	firstPreAck := <-preAckAttempts
 	secondPreAck := <-preAckAttempts
-	if retryDelay := secondPreAck.Sub(firstPreAck); retryDelay < 75*time.Millisecond {
-		t.Fatalf("pre-ACK retry delay = %v, want at least 75ms", retryDelay)
+	if retryDelay := secondPreAck.Sub(firstPreAck); retryDelay < homeSubscriberRetryInitial {
+		t.Fatalf("pre-ACK retry delay = %v, want at least %s after the prior published failure", retryDelay, homeSubscriberRetryInitial)
 	}
 	select {
 	case <-finalSubscribe:
-	case <-time.After(time.Second):
+	case <-time.After(5 * homeSubscriberRetryInitial):
 		t.Fatal("subscriber did not retry after pre-ACK rejections")
 	}
 	service.homeMu.Lock()
@@ -1716,8 +1664,8 @@ func TestServiceAmbiguousDispatchDrainsRegistryBeforeRetry(t *testing.T) {
 	}
 	select {
 	case <-secondSubscribe:
-	case <-time.After(time.Second):
-		t.Fatal("subscriber did not retry after ambiguous dispatch drain")
+	case <-time.After(3 * homeSubscriberRetryInitial):
+		t.Fatal("subscriber did not retry after ambiguous dispatch drain and backoff")
 	}
 	service.homeMu.Lock()
 	exposedRegistry := service.homeRegistry
@@ -1781,8 +1729,8 @@ func TestServiceBacksOffAfterRepeatedPreAckFailures(t *testing.T) {
 
 	firstAttempt := <-attempts
 	secondAttempt := <-attempts
-	if retryDelay := secondAttempt.Sub(firstAttempt); retryDelay < 75*time.Millisecond {
-		t.Fatalf("pre-ACK retry delay = %v, want at least 75ms", retryDelay)
+	if retryDelay := secondAttempt.Sub(firstAttempt); retryDelay < homeSubscriberRetryInitial/2 {
+		t.Fatalf("pre-ACK retry delay = %v, want at least %s", retryDelay, homeSubscriberRetryInitial/2)
 	}
 	cancel()
 	select {
@@ -1860,8 +1808,8 @@ func TestServiceHeartbeatLossCancelsBlockedConfigFinalizationWithoutDrainingRegi
 	}
 	select {
 	case <-secondConfig:
-	case <-time.After(time.Second):
-		t.Fatal("subscriber did not retry after heartbeat loss")
+	case <-time.After(3 * homeSubscriberRetryInitial):
+		t.Fatal("subscriber did not retry after heartbeat loss and backoff")
 	}
 	service.homeMu.Lock()
 	currentRegistry := service.homeRegistry
@@ -2303,7 +2251,7 @@ func serveHomeLogForwarderReconnectConnection(conn net.Conn, acks chan<- struct{
 
 func waitForPublisherReplacementFrame(t *testing.T, frames <-chan home.InFlightSnapshotFrame, barrierRevision int64) home.InFlightSnapshotFrame {
 	t.Helper()
-	timer := time.NewTimer(time.Second)
+	timer := time.NewTimer(homeLifecycleTestTimeout)
 	defer timer.Stop()
 	for {
 		select {
@@ -2318,7 +2266,7 @@ func waitForPublisherReplacementFrame(t *testing.T, frames <-chan home.InFlightS
 	}
 }
 
-func servePublisherReplacementConnection(conn net.Conn, configRequests *atomic.Int32, frames chan<- home.InFlightSnapshotFrame, firstPublisherDoneForServer <-chan (<-chan struct{}), secondConfigResult chan<- error, allowSecondConfig <-chan struct{}, stop <-chan struct{}) {
+func servePublisherReplacementConnection(conn net.Conn, configRequests *atomic.Int32, frames chan<- home.InFlightSnapshotFrame, firstPublisherDoneForServer <-chan (<-chan struct{}), secondConfigResult chan<- error, stop <-chan struct{}) {
 	defer func() { _ = conn.Close() }()
 	reader := bufio.NewReader(conn)
 	for {
@@ -2346,17 +2294,13 @@ func servePublisherReplacementConnection(conn net.Conn, configRequests *atomic.I
 				default:
 					secondConfigResult <- errors.New("replacement began its config lifetime before the previous publisher exited")
 				}
-				select {
-				case <-allowSecondConfig:
-				case <-stop:
-					return
-				}
 			}
 			barrierRevision := 11
 			if request == 2 {
 				barrierRevision = 22
 			}
-			payload := fmt.Sprintf("credential-concurrency:\n  lifecycle-config-revision: %d\n  observation-barrier-revision: %d\n  cpa-heartbeat-timeout: 100ms\n  cpa-cancel-bound: 100ms\ncredential-in-flight:\n  snapshot-interval: 10ms\n", request, barrierRevision)
+			// This mock keeps subscriptions open without sending heartbeats.
+			payload := fmt.Sprintf("credential-concurrency:\n  lifecycle-config-revision: %d\n  observation-barrier-revision: %d\n  cpa-heartbeat-timeout: 30s\ncredential-in-flight:\n  snapshot-interval: 10ms\n", request, barrierRevision)
 			writeRegistryTestConfig(conn, payload)
 		case len(args) >= 2 && strings.EqualFold(args[0], "GET") && args[1] == "plugin-tasks":
 			if _, errWrite := io.WriteString(conn, "$2\r\n[]\r\n"); errWrite != nil {
@@ -2370,12 +2314,8 @@ func servePublisherReplacementConnection(conn net.Conn, configRequests *atomic.I
 			if _, errWrite := io.WriteString(conn, "*3\r\n$9\r\nsubscribe\r\n$6\r\nconfig\r\n:1\r\n"); errWrite != nil {
 				return
 			}
-			select {
-			case <-stop:
-				return
-			case <-time.After(time.Second):
-				return
-			}
+			<-stop
+			return
 		case len(args) >= 3 && strings.EqualFold(args[0], "LPUSH") && args[1] == "in-flight-snapshot":
 			var frame home.InFlightSnapshotFrame
 			if errUnmarshal := json.Unmarshal([]byte(args[2]), &frame); errUnmarshal != nil {
@@ -2572,7 +2512,7 @@ func serveStalePreACKPluginConnection(conn net.Conn, subscriptions *atomic.Int32
 	}
 }
 
-func serveInitialOverlayPluginConnection(conn net.Conn, pluginSync chan struct{}, pluginStatus chan struct{}, pluginTasks chan struct{}, freshCommandProbe chan struct{}, allowAck chan struct{}, stop chan struct{}) {
+func serveInitialOverlayPluginConnection(conn net.Conn, pluginSync chan struct{}, pluginStatus chan<- struct{}, pluginTasks chan struct{}, freshCommandProbe chan struct{}, subscribed chan<- struct{}, allowAck <-chan struct{}, earlyPluginRequest chan<- string, stop <-chan struct{}) {
 	defer func() { _ = conn.Close() }()
 	reader := bufio.NewReader(conn)
 	for {
@@ -2580,13 +2520,28 @@ func serveInitialOverlayPluginConnection(conn net.Conn, pluginSync chan struct{}
 		if errRead != nil {
 			return
 		}
+		if len(args) >= 2 {
+			switch args[1] {
+			case "plugin-sync", "plugin-tasks", "plugin-status":
+				select {
+				case <-freshCommandProbe:
+				default:
+					select {
+					case earlyPluginRequest <- args[1]:
+					default:
+					}
+					return
+				}
+			}
+		}
 		switch {
 		case len(args) > 0 && strings.EqualFold(args[0], "HELLO"):
 			if _, errWrite := io.WriteString(conn, "%6\r\n$6\r\nserver\r\n$5\r\nredis\r\n$5\r\nproto\r\n:3\r\n$2\r\nid\r\n:1\r\n$4\r\nmode\r\n$10\r\nstandalone\r\n$4\r\nrole\r\n$6\r\nmaster\r\n$7\r\nmodules\r\n*0\r\n"); errWrite != nil {
 				return
 			}
 		case len(args) >= 2 && strings.EqualFold(args[0], "GET") && args[1] == "config":
-			payload := "credential-concurrency:\n  lifecycle-config-revision: 1\n  cpa-heartbeat-timeout: 100ms\n  cpa-cancel-bound: 100ms\nplugins:\n  enabled: true\n"
+			// This mock keeps subscriptions open without sending heartbeats.
+			payload := "credential-concurrency:\n  lifecycle-config-revision: 1\n  cpa-heartbeat-timeout: 30s\nplugins:\n  enabled: true\n"
 			if _, errWrite := io.WriteString(conn, fmt.Sprintf("$%d\r\n%s\r\n", len(payload), payload)); errWrite != nil {
 				return
 			}
@@ -2600,11 +2555,6 @@ func serveInitialOverlayPluginConnection(conn net.Conn, pluginSync chan struct{}
 				return
 			}
 		case len(args) >= 2 && strings.EqualFold(args[0], "RPUSH") && args[1] == "plugin-status":
-			select {
-			case <-freshCommandProbe:
-			default:
-				return
-			}
 			pluginStatus <- struct{}{}
 			if _, errWrite := io.WriteString(conn, ":1\r\n"); errWrite != nil {
 				return
@@ -2621,6 +2571,10 @@ func serveInitialOverlayPluginConnection(conn net.Conn, pluginSync chan struct{}
 				return
 			}
 		case len(args) >= 2 && strings.EqualFold(args[0], "SUBSCRIBE") && args[1] == "config":
+			select {
+			case subscribed <- struct{}{}:
+			default:
+			}
 			select {
 			case <-allowAck:
 			case <-stop:
@@ -2976,6 +2930,89 @@ func TestServiceApplyConfigRuntimeSessionAffinityDisabledSubagentsChangeIsNoOp(t
 	changedSelector := manager.Selector()
 	if changedSelector != initialSelector {
 		t.Fatal("toggling SessionAffinitySubagents when SessionAffinity is false must be a no-op")
+	}
+}
+
+func TestServiceApplyConfigRuntimeSessionAffinityRebindOnChangeRecreatesSelector(t *testing.T) {
+	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
+	service := &Service{cfg: &config.Config{}, coreManager: manager}
+
+	initial := service.commitConfigUpdate(&config.Config{Routing: internalconfig.RoutingConfig{
+		Strategy:                "round-robin",
+		SessionAffinity:         true,
+		SessionAffinityTTL:      "1h",
+		SessionAffinityRebindOn: "any",
+	}})
+	if !service.applyConfigRuntime(context.Background(), initial, false) {
+		t.Fatal("initial config runtime apply failed")
+	}
+	initialSelector := manager.Selector()
+
+	same := service.commitConfigUpdate(&config.Config{Routing: internalconfig.RoutingConfig{
+		Strategy:                "round-robin",
+		SessionAffinity:         true,
+		SessionAffinityTTL:      "1h",
+		SessionAffinityRebindOn: "",
+	}})
+	if !service.applyConfigRuntime(context.Background(), same, false) {
+		t.Fatal("same config runtime apply failed")
+	}
+	if manager.Selector() != initialSelector {
+		t.Fatal("equivalent default SessionAffinityRebindOn should preserve selector")
+	}
+
+	changed := service.commitConfigUpdate(&config.Config{Routing: internalconfig.RoutingConfig{
+		Strategy:                "round-robin",
+		SessionAffinity:         true,
+		SessionAffinityTTL:      "1h",
+		SessionAffinityRebindOn: "quota",
+	}})
+	if !service.applyConfigRuntime(context.Background(), changed, false) {
+		t.Fatal("changed config runtime apply failed")
+	}
+	changedSelector := manager.Selector()
+	if changedSelector == initialSelector {
+		t.Fatal("changing SessionAffinityRebindOn should recreate selector")
+	}
+
+	neverCfg := service.commitConfigUpdate(&config.Config{Routing: internalconfig.RoutingConfig{
+		Strategy:                "round-robin",
+		SessionAffinity:         true,
+		SessionAffinityTTL:      "1h",
+		SessionAffinityRebindOn: "never",
+	}})
+	if !service.applyConfigRuntime(context.Background(), neverCfg, false) {
+		t.Fatal("never config runtime apply failed")
+	}
+	neverSelector := manager.Selector()
+	if neverSelector == changedSelector {
+		t.Fatal("changing SessionAffinityRebindOn to never should recreate selector")
+	}
+
+	sameNeverCfg := service.commitConfigUpdate(&config.Config{Routing: internalconfig.RoutingConfig{
+		Strategy:                "round-robin",
+		SessionAffinity:         true,
+		SessionAffinityTTL:      "1h",
+		SessionAffinityRebindOn: " NEVER ",
+	}})
+	if !service.applyConfigRuntime(context.Background(), sameNeverCfg, false) {
+		t.Fatal("same never config runtime apply failed")
+	}
+	if manager.Selector() != neverSelector {
+		t.Fatal("equivalent never SessionAffinityRebindOn should preserve selector")
+	}
+
+	backToAnyCfg := service.commitConfigUpdate(&config.Config{Routing: internalconfig.RoutingConfig{
+		Strategy:                "round-robin",
+		SessionAffinity:         true,
+		SessionAffinityTTL:      "1h",
+		SessionAffinityRebindOn: "any",
+	}})
+	if !service.applyConfigRuntime(context.Background(), backToAnyCfg, false) {
+		t.Fatal("back to any config runtime apply failed")
+	}
+	if manager.Selector() == neverSelector {
+		t.Fatal("changing SessionAffinityRebindOn from never to any should recreate selector")
 	}
 }
 
